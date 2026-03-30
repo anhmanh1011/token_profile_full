@@ -6,12 +6,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TokenRedis:
-    def __init__(self, host='127.0.0.1', port=6379, db=0):
+    def __init__(self, host: str = '127.0.0.1', port: int = 6379, db: int = 0) -> None:
         self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True)
         self.r.ping()
         logger.info(f"Redis connected: {host}:{port}")
 
-    def push_token(self, email, password, refresh_token, tenant_id):
+    def push_token(self, email: str, password: str, refresh_token: str, tenant_id: str) -> None:
         """Push a fresh token to Redis"""
         token_data = json.dumps({
             "email": email,
@@ -24,7 +24,7 @@ class TokenRedis:
         key = f"tokens:{tenant_id}:fresh"
         self.r.rpush(key, token_data)
 
-    def get_accounts_to_login(self, tenant_id, all_accounts):
+    def get_accounts_to_login(self, tenant_id: str, all_accounts: list[str]) -> list[str]:
         """Determine which accounts need to be logged in."""
         accounts_in_redis = set()
         cooldown_ready = []
@@ -61,7 +61,7 @@ class TokenRedis:
         )
         return result
 
-    def stats(self, tenant_id):
+    def stats(self, tenant_id: str) -> dict[str, int]:
         """Return queue lengths"""
         return {
             "fresh": self.r.llen(f"tokens:{tenant_id}:fresh"),

