@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -218,7 +219,7 @@ func main() {
 	elapsed := time.Since(startTime)
 	processed, successful, failed, exactMatch := pool.Stats()
 
-	fmt.Println(repeatString("=", 60))
+	fmt.Println(strings.Repeat("=", 60))
 	log.Println("=== FINAL STATISTICS ===")
 
 	// Show stop reason
@@ -241,7 +242,7 @@ func main() {
 	tTotal, tAlive, tDead := tokenManager.Stats()
 	log.Printf("Tokens:          %d total, %d alive, %d dead", tTotal, tAlive, tDead)
 
-	fmt.Println(repeatString("=", 60))
+	fmt.Println(strings.Repeat("=", 60))
 	log.Printf("Results saved to: %s", cfg.ResultsFile)
 
 	if pool.StoppedEarly() {
@@ -249,13 +250,4 @@ func main() {
 	} else {
 		log.Println("Application finished successfully.")
 	}
-}
-
-// repeatString returns a string repeated n times
-func repeatString(s string, n int) string {
-	result := ""
-	for i := 0; i < n; i++ {
-		result += s
-	}
-	return result
 }

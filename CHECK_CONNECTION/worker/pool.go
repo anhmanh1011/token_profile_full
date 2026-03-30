@@ -159,8 +159,10 @@ func (p *Pool) ShutdownWithReason(reason string) {
 	p.stopReason = reason
 	atomic.StoreInt32(&p.stoppedEarly, 1)
 	p.cancel()
-	// Close token queue to unblock workers waiting at AcquireToken()
-	p.tokenManager.CloseQueue()
+	// Close token queue to unblock workers waiting at AcquireToken() (file mode only)
+	if p.tokenBuffer == nil {
+		p.tokenManager.CloseQueue()
+	}
 	p.Close()
 }
 
@@ -352,7 +354,7 @@ func (p *Pool) workerWithAPIBuffer() {
 		// 2. Refresh token
 		accessToken, err := p.tokenManager.GetAccessToken(tkn)
 		if err != nil {
-			p.tokenBuffer.ReportExhausted(tkn.Username)
+			p.tokenBuffer.ReportExhausted(p.ctx, tkn.Username)
 			log.Printf("[TOKEN] Token refresh failed for %s, getting new token", tkn.Username)
 			continue
 		}
@@ -372,7 +374,7 @@ func (p *Pool) workerWithAPIBuffer() {
 				newAccessToken, err := p.tokenManager.GetAccessToken(tkn)
 				if err != nil {
 					tokenDead = true
-					p.tokenBuffer.ReportExhausted(tkn.Username)
+					p.tokenBuffer.ReportExhausted(p.ctx, tkn.Username)
 					p.safeRequeue(email)
 					break
 				}
@@ -391,7 +393,7 @@ func (p *Pool) workerWithAPIBuffer() {
 			// Handle token death (401/424)
 			if statusCode == 401 || statusCode == 424 {
 				tokenDead = true
-				p.tokenBuffer.ReportExhausted(tkn.Username)
+				p.tokenBuffer.ReportExhausted(p.ctx, tkn.Username)
 				log.Printf("[TOKEN] Token dead (status %d) for %s", statusCode, tkn.Username)
 				p.safeRequeue(email)
 				break
@@ -411,10 +413,10 @@ func (p *Pool) workerWithAPIBuffer() {
 				atomic.AddUint64(&p.failed, 1)
 
 				if statusCode == 500 {
-					newCount := token.IncrFailCount(tkn)
+					newCount := tkn.IncrFailCount()
 					if newCount >= 5 {
 						tokenDead = true
-						p.tokenBuffer.ReportExhausted(tkn.Username)
+						p.tokenBuffer.ReportExhausted(p.ctx, tkn.Username)
 						log.Printf("[TOKEN] Token exhausted (5x 500) for %s", tkn.Username)
 						p.safeRequeue(email)
 						break
@@ -426,7 +428,7 @@ func (p *Pool) workerWithAPIBuffer() {
 
 			// Success
 			if err == nil {
-				token.ResetTokenFailCount(tkn)
+				tkn.ResetFailCount()
 				atomic.AddUint64(&p.successful, 1)
 				if result != nil {
 					atomic.AddUint64(&p.exactMatch, 1)

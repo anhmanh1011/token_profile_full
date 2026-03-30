@@ -1,6 +1,7 @@
 package token
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type TokenBuffer struct {
 
 	threshold int
 	stopCh    chan struct{}
+	stopOnce  sync.Once
 	wg        sync.WaitGroup
 }
 
@@ -45,7 +47,9 @@ func (b *TokenBuffer) Start() error {
 	if err != nil {
 		return err
 	}
+	b.activeMu.Lock()
 	b.active = tokens
+	b.activeMu.Unlock()
 	log.Printf("[BUFFER] Loaded %d tokens into active pool", len(tokens))
 
 	b.wg.Add(1)
@@ -81,9 +85,9 @@ func (b *TokenBuffer) AcquireToken() *TokenInfo {
 	return token
 }
 
-func (b *TokenBuffer) ReportExhausted(email string) {
+func (b *TokenBuffer) ReportExhausted(ctx context.Context, email string) {
 	go func() {
-		if err := b.apiClient.ReportExhausted(email); err != nil {
+		if err := b.apiClient.ReportExhausted(ctx, email); err != nil {
 			log.Printf("[BUFFER] Report exhausted failed for %s: %v", email, err)
 		}
 	}()
@@ -134,14 +138,22 @@ func (b *TokenBuffer) prefetchLoop() {
 			tokens, err := b.fetchBatch()
 			if err != nil {
 				log.Printf("[BUFFER] Prefetch failed: %v, retrying in 5s", err)
-				time.Sleep(5 * time.Second)
+				select {
+				case <-time.After(5 * time.Second):
+				case <-b.stopCh:
+					return
+				}
 				b.triggerPrefetch()
 				continue
 			}
 
 			if len(tokens) == 0 {
 				log.Printf("[BUFFER] No fresh tokens available, retrying in 10s")
-				time.Sleep(10 * time.Second)
+				select {
+				case <-time.After(10 * time.Second):
+				case <-b.stopCh:
+					return
+				}
 				b.triggerPrefetch()
 				continue
 			}
@@ -174,7 +186,7 @@ func (b *TokenBuffer) fetchBatch() ([]*TokenInfo, error) {
 }
 
 func (b *TokenBuffer) Stop() {
-	close(b.stopCh)
+	b.stopOnce.Do(func() { close(b.stopCh) })
 	b.wg.Wait()
 }
 

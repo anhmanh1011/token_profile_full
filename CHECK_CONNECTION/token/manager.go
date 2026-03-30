@@ -36,11 +36,11 @@ type TokenInfo struct {
 	TenantID     string
 	AccessToken  string
 	ExpiresAt    time.Time
-	dead         int32      // atomic flag: 0=alive, 1=dead (refresh token invalid)
-	exhausted    int32      // atomic flag: 0=có quota, 1=hết quota
-	failCount    int32      // atomic: số lần fail liên tiếp với status 500
-	exhaustedAt  time.Time  // thời điểm bị đánh dấu exhausted
-	mu           sync.Mutex // per-token lock for refresh
+	dead            int32      // atomic flag: 0=alive, 1=dead (refresh token invalid)
+	exhausted       int32      // atomic flag: 0=có quota, 1=hết quota
+	failCount       int32      // atomic: số lần fail liên tiếp với status 500
+	exhaustedAtUnix int64      // atomic unix seconds: thời điểm bị đánh dấu exhausted
+	mu              sync.Mutex // per-token lock for refresh
 }
 
 // RefreshTokenResponse is the response from Microsoft OAuth endpoint
@@ -160,7 +160,7 @@ func (m *Manager) refreshAccessToken(info *TokenInfo) error {
 	// Check if quota exhausted - không refresh nếu đã hết quota
 	if atomic.LoadInt32(&info.exhausted) == 1 {
 		// Kiểm tra xem đã sang ngày mới chưa (reset quota)
-		if !m.isNewDay(info.exhaustedAt) {
+		if !m.isNewDay(info) {
 			return fmt.Errorf("quota exhausted, wait until tomorrow")
 		}
 		// Reset quota cho ngày mới
@@ -187,7 +187,7 @@ func (m *Manager) refreshAccessToken(info *TokenInfo) error {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
+			// Exponential backoff: 2s, 4s (attempt=1,2)
 			backoffDuration := time.Duration(1<<attempt) * time.Second
 			time.Sleep(backoffDuration)
 		}
@@ -257,16 +257,16 @@ func (m *Manager) refreshAccessToken(info *TokenInfo) error {
 	return lastErr
 }
 
-// isNewDay checks if exhaustedAt is from a previous day
-func (m *Manager) isNewDay(exhaustedAt time.Time) bool {
-	if exhaustedAt.IsZero() {
+// isNewDay checks if the token's exhaustedAt timestamp is from a previous calendar day (UTC).
+func (m *Manager) isNewDay(info *TokenInfo) bool {
+	ts := atomic.LoadInt64(&info.exhaustedAtUnix)
+	if ts == 0 {
 		return false
 	}
-	now := time.Now()
-	// So sánh ngày (bỏ qua giờ phút giây)
-	return now.Year() > exhaustedAt.Year() ||
-		now.YearDay() > exhaustedAt.YearDay() ||
-		(now.Year() == exhaustedAt.Year() && now.YearDay() > exhaustedAt.YearDay())
+	exhaustedAt := time.Unix(ts, 0)
+	nowDay := time.Now().UTC().Truncate(24 * time.Hour)
+	exhaustedDay := exhaustedAt.UTC().Truncate(24 * time.Hour)
+	return nowDay.After(exhaustedDay)
 }
 
 // GetToken returns the current active access token (lock-free hot path)
@@ -297,13 +297,14 @@ func (m *Manager) GetToken() (string, error) {
 		// Check if quota exhausted
 		if atomic.LoadInt32(&info.exhausted) == 1 {
 			// Kiểm tra xem đã sang ngày mới chưa
-			if !m.isNewDay(info.exhaustedAt) {
+			if !m.isNewDay(info) {
 				continue
 			}
-			// Reset cho ngày mới
-			atomic.StoreInt32(&info.exhausted, 0)
-			atomic.StoreInt32(&info.failCount, 0)
-			atomic.AddInt32(&m.exhaustedCount, -1)
+			// Reset cho ngày mới - use CAS to avoid double-decrement
+			if atomic.CompareAndSwapInt32(&info.exhausted, 1, 0) {
+				atomic.StoreInt32(&info.failCount, 0)
+				atomic.AddInt32(&m.exhaustedCount, -1)
+			}
 		}
 
 		// Check if token is valid (read without lock - slight race is OK)
@@ -340,7 +341,7 @@ func (m *Manager) MarkQuotaExhausted(accessToken string) bool {
 			// Nếu vượt threshold, đánh dấu exhausted
 			if newCount >= QuotaExhaustedThreshold {
 				if atomic.CompareAndSwapInt32(&info.exhausted, 0, 1) {
-					info.exhaustedAt = time.Now()
+					atomic.StoreInt64(&info.exhaustedAtUnix, time.Now().Unix())
 					atomic.AddInt32(&m.exhaustedCount, 1)
 					return true
 				}
@@ -505,12 +506,12 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 }
 
 // IncrFailCount atomically increments the fail count for a token and returns the new value.
-func IncrFailCount(t *TokenInfo) int32 {
+func (t *TokenInfo) IncrFailCount() int32 {
 	return atomic.AddInt32(&t.failCount, 1)
 }
 
-// ResetTokenFailCount atomically resets the fail count for a token to zero.
-func ResetTokenFailCount(t *TokenInfo) {
+// ResetFailCount atomically resets the fail count for a token to zero.
+func (t *TokenInfo) ResetFailCount() {
 	atomic.StoreInt32(&t.failCount, 0)
 }
 
@@ -575,7 +576,9 @@ func (m *Manager) saveRefreshedTokensLoop() {
 				token.Password,
 				token.RefreshToken,
 				token.TenantID)
-			writer.WriteString(line)
+			if _, err := writer.WriteString(line); err != nil {
+				fmt.Printf("[ERROR] Failed to write refreshed token: %v\n", err)
+			}
 
 		case <-ticker.C:
 			// Periodic flush
@@ -626,7 +629,9 @@ func (m *Manager) SaveAliveTokens(filename string) (int, error) {
 				token.Password,
 				token.RefreshToken,
 				token.TenantID)
-			writer.WriteString(line)
+			if _, err := writer.WriteString(line); err != nil {
+				return count, fmt.Errorf("failed to write token: %w", err)
+			}
 			count++
 		}
 	}
