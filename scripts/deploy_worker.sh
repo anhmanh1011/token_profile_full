@@ -1,51 +1,79 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CENTRAL_API="${CENTRAL_API:-http://central-ip:8080}"
-TENANT_ID="${TENANT_ID:-}"
-MAX_CPM="${MAX_CPM:-20000}"
-WORKERS="${WORKERS:-500}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/parse_config.sh"
 
-if [ -z "$TENANT_ID" ]; then
-    echo "Error: TENANT_ID not set"
-    echo "Usage: TENANT_ID=xxx CENTRAL_API=http://ip:8080 ./deploy_worker.sh"
+CENTRAL_IP="${1:-}"
+if [ -z "$CENTRAL_IP" ]; then
+    echo "Usage: $0 <central-vps-ip> [tenant-index]"
+    echo ""
+    echo "Tenants:"
+    for i in $(seq 0 $((TENANT_COUNT - 1))); do
+        echo "  $i: ${TENANT_NAMES[$i]} (${TENANT_IDS[$i]}) -> ${WORKER_HOSTS[$i]}"
+    done
+    echo ""
+    echo "Deploy all:  $0 <central-ip>"
+    echo "Deploy one:  $0 <central-ip> 0"
     exit 1
 fi
 
-echo "=== Worker VPS Deployment ==="
-echo "API: $CENTRAL_API"
-echo "Tenant: $TENANT_ID"
-echo "CPM: $MAX_CPM"
+CENTRAL_API="http://${CENTRAL_IP}:${CENTRAL_API_PORT}"
 
-echo "Building CHECK_CONNECTION..."
-cd /opt/check-connection
+deploy_worker() {
+    local idx=$1
+    local tenant_id="${TENANT_IDS[$idx]}"
+    local name="${TENANT_NAMES[$idx]}"
+    local host="${WORKER_HOSTS[$idx]}"
+    local user="${WORKER_USERS[$idx]}"
+    local dir="${WORKER_DIRS[$idx]}"
+    local max_cpm="${WORKER_CPMS[$idx]}"
+    local workers="${WORKER_COUNTS[$idx]}"
+
+    echo "=== Deploying $name to $host ==="
+    echo "  Tenant: $tenant_id"
+    echo "  API:    $CENTRAL_API"
+    echo "  CPM:    $max_cpm"
+
+    ssh "${user}@${host}" bash -s <<REMOTE
+set -euo pipefail
+
+cd "$dir"
 go build -o check_connection .
-echo "Built successfully"
 
-cat > /etc/systemd/system/check-connection.service << EOF
+cat > /etc/systemd/system/check-connection.service << 'UNIT'
 [Unit]
-Description=CHECK_CONNECTION Worker ($TENANT_ID)
+Description=CHECK_CONNECTION Worker ($name)
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/check-connection
-ExecStart=/opt/check-connection/check_connection \
-    -api $CENTRAL_API \
-    -tenant $TENANT_ID \
-    -emails emails.txt \
-    -max-cpm $MAX_CPM \
-    -workers $WORKERS
+WorkingDirectory=$dir
+ExecStart=$dir/check_connection \\
+    -api $CENTRAL_API \\
+    -tenant $tenant_id \\
+    -emails emails.txt \\
+    -max-cpm $max_cpm \\
+    -workers $workers
 Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
 systemctl daemon-reload
 systemctl enable check-connection
+echo "Done: systemctl start check-connection"
+REMOTE
 
-echo ""
-echo "=== Worker Deployment Complete ==="
-echo "Start: systemctl start check-connection"
-echo "Logs:  journalctl -u check-connection -f"
+    echo "=== $name deployed ==="
+    echo ""
+}
+
+if [ -n "${2:-}" ]; then
+    deploy_worker "$2"
+else
+    for i in $(seq 0 $((TENANT_COUNT - 1))); do
+        deploy_worker "$i"
+    done
+fi
