@@ -119,9 +119,40 @@ ssh root@worker-ip "wc -l /opt/check-connection/result_*.txt"
 
 ## Hien trang trien khai
 
-- [x] Token API (Go) — hoan thanh
-- [x] VN-TAKK Redis integration (Python) — hoan thanh
-- [x] CHECK_CONNECTION API mode (Go) — hoan thanh
+- [x] Token API (Go) — hoan thanh + code review fixes
+- [x] VN-TAKK Redis integration (Python) — hoan thanh + code review fixes
+- [x] CHECK_CONNECTION API mode (Go) — hoan thanh + code review fixes
 - [x] Deploy scripts — hoan thanh
 - [x] Config tap trung (config.yaml) — hoan thanh
 - [ ] Trien khai len VPS — cho thong tin VPS tu user
+
+## Code Review Fixes (2026-03-30)
+
+### Token API
+- Redis PopFreshTokens: LPOP+RPUSH → LMOVE (atomic, 1 round-trip/token)
+- Redis MarkExhausted: Go loop → Lua script (atomic, tranh duplicate)
+- Error handling: khong leak err.Error() ra client, log internal
+- Server timeouts: Read 10s, Write 30s, Idle 120s
+- Graceful shutdown: server.Close() → server.Shutdown(10s context)
+- Count parameter: gioi han toi da 500
+
+### CHECK_CONNECTION
+- Race fix: exhaustedAt time.Time → int64 atomic
+- Race fix: exhaustedCount decrement dung CAS guard
+- Buffer: double-close panic → sync.Once
+- Buffer: time.Sleep → select interruptible by stopCh
+- Buffer: Start() hold activeMu khi set active
+- api_client: fmt.Sprintf → json.Marshal (tranh JSON injection)
+- api_client: response body limited 1MB
+- worker: ReportExhausted truyen context cho cancellation
+- worker: ShutdownWithReason chi CloseQueue khi file mode
+- main: repeatString → strings.Repeat
+
+### VN-TAKK
+- Thread-safe: them _write_lock + safe_write() cho file writes
+- Resource: tat ca open().write() → context manager (with)
+- Exception: bare except → except (IndexError, KeyError)
+- Crash fix: login_common kiem tra header truoc khi regex
+- Imports: consolidate PEP 8, xoa duplicates va unused
+- Type hints: them cho public methods
+- Deps: pin tat ca versions trong requirements.txt

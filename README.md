@@ -83,6 +83,13 @@ Tat ca cau hinh nam trong `config.yaml`. Dien 1 lan, tat ca scripts tu doc tu do
 
 Xem chi tiet: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 
+## API Luu y
+
+- `count` toi da 500 moi request (server tu clamp)
+- Redis operations su dung `LMOVE` (atomic) va Lua script de tranh race condition
+- Token API co server timeouts: Read 10s, Write 30s, Idle 120s
+- Graceful shutdown voi 10s drain timeout
+
 ## Thong so
 
 | Metric | Value |
@@ -93,3 +100,24 @@ Xem chi tiet: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 | Token/ngay | ~10-15K |
 | Refresh token TTL | 24h |
 | Token cooldown | 24h sau khi exhausted |
+
+## Code Quality
+
+### Token API (Go)
+- Redis atomic operations (LMOVE, Lua script cho MarkExhausted)
+- Proper error handling (khong leak internal errors ra client)
+- HTTP server timeouts + graceful shutdown
+- Count parameter gioi han toi da 500
+
+### CHECK_CONNECTION (Go)
+- Race-free token management (atomic exhaustedAt, CAS guards)
+- Buffer 2 lop voi interruptible sleep, double-close protection
+- JSON marshal thay vi fmt.Sprintf (tranh injection)
+- Context propagation cho goroutine cancellation
+
+### VN-TAKK (Python)
+- Thread-safe file writes voi threading.Lock
+- File handles dong dung cach (context manager)
+- Specific exception handling (khong dung bare except)
+- Type hints tren cac public methods
+- PEP 8 imports, pinned dependencies
