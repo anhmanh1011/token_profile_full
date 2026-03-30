@@ -19,6 +19,7 @@ type Pool struct {
 	numWorkers   int
 	apiClient    *api.Client
 	tokenManager *token.Manager
+	tokenBuffer  *token.TokenBuffer // nil if using file-based tokens
 	resultWriter *writer.ResultWriter
 
 	// Channels - use larger buffer
@@ -48,7 +49,7 @@ type Pool struct {
 }
 
 // NewPool creates a new worker pool
-func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int) *Pool {
+func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager, tokenBuffer *token.TokenBuffer, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Use larger buffer for better throughput
@@ -74,6 +75,7 @@ func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager,
 		numWorkers:   numWorkers,
 		apiClient:    apiClient,
 		tokenManager: tokenManager,
+		tokenBuffer:  tokenBuffer,
 		resultWriter: resultWriter,
 		jobsChan:     make(chan string, bufferSize),
 		limiter:      limiter,
@@ -190,10 +192,11 @@ func (p *Pool) safeRequeue(email string) {
 func (p *Pool) worker() {
 	defer p.wg.Done()
 
-	if p.tokenManager.IsQueueMode() {
+	if p.tokenBuffer != nil {
+		p.workerWithAPIBuffer()
+	} else if p.tokenManager.IsQueueMode() {
 		p.workerWithTokenQueue()
 	} else {
-		// Legacy mode: round-robin tokens
 		for email := range p.jobsChan {
 			p.processEmail(email)
 		}
@@ -326,6 +329,132 @@ func (p *Pool) workerWithTokenQueue() {
 				continue // Get new token
 			}
 			return // jobsChan closed normally
+		}
+	}
+}
+
+// workerWithAPIBuffer — worker using centralized Token API buffer
+func (p *Pool) workerWithAPIBuffer() {
+	for {
+		// 1. Acquire token from buffer
+		tkn := p.tokenBuffer.AcquireToken()
+		if tkn == nil {
+			log.Printf("[WORKER] No tokens available from buffer, waiting 5s...")
+			time.Sleep(5 * time.Second)
+			select {
+			case <-p.ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+
+		// 2. Refresh token
+		accessToken, err := p.tokenManager.GetAccessToken(tkn)
+		if err != nil {
+			p.tokenBuffer.ReportExhausted(tkn.Username)
+			log.Printf("[TOKEN] Token refresh failed for %s, getting new token", tkn.Username)
+			continue
+		}
+
+		// 3. Process emails with this token
+		tokenDead := false
+		for email := range p.jobsChan {
+			if tokenDead {
+				p.safeRequeue(email)
+				break
+			}
+
+			atomic.AddUint64(&p.processed, 1)
+
+			// Check if access token needs refresh
+			if tkn.ExpiresAt.Before(time.Now().Add(30 * time.Second)) {
+				newAccessToken, err := p.tokenManager.GetAccessToken(tkn)
+				if err != nil {
+					tokenDead = true
+					p.tokenBuffer.ReportExhausted(tkn.Username)
+					p.safeRequeue(email)
+					break
+				}
+				accessToken = newAccessToken
+			}
+
+			// Wait for rate limit
+			if err := p.waitForRateLimit(); err != nil {
+				p.safeRequeue(email)
+				return
+			}
+
+			// Make API call
+			result, statusCode, err := p.apiClient.FetchProfile(email, accessToken)
+
+			// Handle token death (401/424)
+			if statusCode == 401 || statusCode == 424 {
+				tokenDead = true
+				p.tokenBuffer.ReportExhausted(tkn.Username)
+				log.Printf("[TOKEN] Token dead (status %d) for %s", statusCode, tkn.Username)
+				p.safeRequeue(email)
+				break
+			}
+
+			// Handle 403 - rate limit
+			if statusCode == 403 {
+				p.trackFailReason("status_403")
+				atomic.AddUint64(&p.failed, 1)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			// Handle 5xx
+			if statusCode >= 500 {
+				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
+				atomic.AddUint64(&p.failed, 1)
+
+				if statusCode == 500 {
+					newCount := token.IncrFailCount(tkn)
+					if newCount >= 5 {
+						tokenDead = true
+						p.tokenBuffer.ReportExhausted(tkn.Username)
+						log.Printf("[TOKEN] Token exhausted (5x 500) for %s", tkn.Username)
+						p.safeRequeue(email)
+						break
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// Success
+			if err == nil {
+				token.ResetTokenFailCount(tkn)
+				atomic.AddUint64(&p.successful, 1)
+				if result != nil {
+					atomic.AddUint64(&p.exactMatch, 1)
+					if writeErr := p.resultWriter.WriteResult(result); writeErr != nil {
+						log.Printf("[WRITER] Failed to write result: %v", writeErr)
+					}
+				}
+				continue
+			}
+
+			// Other errors
+			if statusCode > 0 {
+				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
+			} else {
+				p.trackFailReason("connection_error")
+			}
+			atomic.AddUint64(&p.failed, 1)
+		}
+
+		// Get new token for next loop
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+			if tokenDead {
+				continue
+			}
+			return // jobsChan closed
 		}
 	}
 }

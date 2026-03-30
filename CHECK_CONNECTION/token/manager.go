@@ -504,6 +504,16 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 	return token.AccessToken, nil
 }
 
+// IncrFailCount atomically increments the fail count for a token and returns the new value.
+func IncrFailCount(t *TokenInfo) int32 {
+	return atomic.AddInt32(&t.failCount, 1)
+}
+
+// ResetTokenFailCount atomically resets the fail count for a token to zero.
+func ResetTokenFailCount(t *TokenInfo) {
+	atomic.StoreInt32(&t.failCount, 0)
+}
+
 // QueueLen returns current queue length
 func (m *Manager) QueueLen() int {
 	if m.tokenQueue == nil {

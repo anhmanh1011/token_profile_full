@@ -32,6 +32,9 @@ func main() {
 	refreshedTokensFile := flag.String("refreshed", "tokens_refreshed.txt", "Path to save refreshed tokens")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = unlimited)")
+	apiURL := flag.String("api", "", "Central Token API URL (enables API mode)")
+	tenantID := flag.String("tenant", "", "Tenant ID for this worker")
+	batchSize := flag.Int("batch", 100, "Tokens per API fetch")
 	flag.Parse()
 
 	// Generate timestamped filenames
@@ -91,29 +94,41 @@ func main() {
 	log.Printf("[FILES] Emails: %s | Tokens: %s | Result: %s",
 		cfg.EmailsFile, cfg.TokensFile, cfg.ResultsFile)
 
-	// Check if input files exist
+	// Check if emails file exists
 	if _, err := os.Stat(cfg.EmailsFile); os.IsNotExist(err) {
 		log.Fatalf("[ERROR] Emails file not found: %s", cfg.EmailsFile)
-	}
-	if _, err := os.Stat(cfg.TokensFile); os.IsNotExist(err) {
-		log.Fatalf("[ERROR] Tokens file not found: %s", cfg.TokensFile)
 	}
 
 	// Initialize token manager
 	tokenManager := token.NewManager()
-	if err := tokenManager.LoadFromFile(cfg.TokensFile); err != nil {
-		log.Fatalf("[ERROR] Failed to load tokens: %v", err)
+
+	var tokenBuffer *token.TokenBuffer
+
+	if *apiURL != "" && *tenantID != "" {
+		// API mode — fetch tokens from central Token API
+		log.Printf("[TOKEN] API mode: %s (tenant: %s, batch: %d)", *apiURL, *tenantID, *batchSize)
+		tokenAPIClient := token.NewAPIClient(*apiURL, *tenantID)
+		tokenBuffer = token.NewTokenBuffer(tokenAPIClient, *batchSize)
+		if err := tokenBuffer.Start(); err != nil {
+			log.Fatalf("[ERROR] Failed to start token buffer: %v", err)
+		}
+		defer tokenBuffer.Stop()
+		log.Printf("[BUFFER] Token buffer started")
+	} else {
+		// File mode — load tokens from local file (original behavior)
+		if _, err := os.Stat(cfg.TokensFile); os.IsNotExist(err) {
+			log.Fatalf("[ERROR] Tokens file not found: %s", cfg.TokensFile)
+		}
+		if err := tokenManager.LoadFromFile(cfg.TokensFile); err != nil {
+			log.Fatalf("[ERROR] Failed to load tokens: %v", err)
+		}
+		total, alive, _ := tokenManager.Stats()
+		log.Printf("[TOKEN] Loaded %d tokens (%d alive)", total, alive)
+		tokenManager.InitQueue()
+		log.Printf("[TOKEN] Queue mode enabled, %d tokens in queue", tokenManager.QueueLen())
+		tokenManager.StartRefreshTokenSaver(*refreshedTokensFile)
+		log.Printf("[TOKEN] Refreshed tokens will be saved to: %s", *refreshedTokensFile)
 	}
-	total, alive, _ := tokenManager.Stats()
-	log.Printf("[TOKEN] Loaded %d tokens (%d alive)", total, alive)
-
-	// Initialize token queue mode
-	tokenManager.InitQueue()
-	log.Printf("[TOKEN] Queue mode enabled, %d tokens in queue", tokenManager.QueueLen())
-
-	// Start refresh token saver
-	tokenManager.StartRefreshTokenSaver(*refreshedTokensFile)
-	log.Printf("[TOKEN] Refreshed tokens will be saved to: %s", *refreshedTokensFile)
 
 	// Initialize email reader
 	emailReader := reader.NewEmailReader(cfg.EmailsFile, cfg.FileBufferSize)
@@ -135,7 +150,7 @@ func main() {
 	log.Println("[API] Client initialized")
 
 	// Initialize worker pool
-	pool := worker.NewPool(cfg.NumWorkers, apiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
+	pool := worker.NewPool(cfg.NumWorkers, apiClient, tokenManager, tokenBuffer, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
 
 	// Start progress reporter
 	pool.StartProgressReporter(5*time.Second, totalEmails)

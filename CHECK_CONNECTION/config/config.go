@@ -20,6 +20,11 @@ type Config struct {
 	EmailBufferSize  int
 	ResultBufferSize int
 	FileBufferSize   int
+
+	// Token API settings (centralized mode)
+	TokenAPIURL string // Central Token API URL (e.g. http://central:8080)
+	TenantID    string // Tenant ID for this worker
+	BatchSize   int    // Tokens per API fetch (default 100)
 }
 
 func NewConfig() *Config {
@@ -47,5 +52,10 @@ func NewConfig() *Config {
 		EmailBufferSize:  100000,          // 100K email buffer
 		ResultBufferSize: 10000,           // 10K result buffer
 		FileBufferSize:   4 * 1024 * 1024, // 4MB file buffer
+
+		// Token API defaults
+		TokenAPIURL: "",
+		TenantID:    "",
+		BatchSize:   100,
 	}
 }
