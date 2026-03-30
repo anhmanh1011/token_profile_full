@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
+
+const maxCount = 500
 
 type Handler struct {
 	store *RedisStore
@@ -54,11 +57,14 @@ func (h *Handler) handleGetTokens(w http.ResponseWriter, r *http.Request, tenant
 			count = parsed
 		}
 	}
+	if count > maxCount {
+		count = maxCount
+	}
 
 	tokens, err := h.store.PopFreshTokens(r.Context(), tenantID, count)
 	if err != nil {
 		log.Printf("[ERROR] PopFreshTokens: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -80,8 +86,10 @@ func (h *Handler) handleExhausted(w http.ResponseWriter, r *http.Request, tenant
 		return
 	}
 
-	if err := h.store.MarkExhausted(r.Context(), tenantID, req.Email); err != nil {
-		log.Printf("[WARN] MarkExhausted: %v", err)
+	if err := h.store.MarkExhausted(r.Context(), tenantID, req.Email, time.Now()); err != nil {
+		log.Printf("[ERROR] MarkExhausted: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, OKResponse{OK: true})
@@ -90,7 +98,8 @@ func (h *Handler) handleExhausted(w http.ResponseWriter, r *http.Request, tenant
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request, tenantID string) {
 	stats, err := h.store.GetStats(r.Context(), tenantID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[ERROR] GetStats tenant=%s: %v", tenantID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)
@@ -99,7 +108,8 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request, tenantID s
 func (h *Handler) handleStatsAll(w http.ResponseWriter, r *http.Request) {
 	tenants, err := h.store.GetAllTenants(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[ERROR] GetAllTenants: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -107,6 +117,7 @@ func (h *Handler) handleStatsAll(w http.ResponseWriter, r *http.Request) {
 	for _, t := range tenants {
 		stats, err := h.store.GetStats(r.Context(), t)
 		if err != nil {
+			log.Printf("[ERROR] GetStats tenant=%s: %v", t, err)
 			continue
 		}
 		allStats = append(allStats, stats)
@@ -115,8 +126,10 @@ func (h *Handler) handleStatsAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, allStats)
 }
 
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("[ERROR] writeJSON encode: %v", err)
+	}
 }

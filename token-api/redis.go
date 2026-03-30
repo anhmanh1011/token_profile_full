@@ -35,21 +35,22 @@ func NewRedisStore(addr string) (*RedisStore, error) {
 	return &RedisStore{client: client}, nil
 }
 
-func freshKey(tenantID string) string { return fmt.Sprintf("tokens:%s:fresh", tenantID) }
-func inUseKey(tenantID string) string { return fmt.Sprintf("tokens:%s:in_use", tenantID) }
-func usedKey(tenantID string) string  { return fmt.Sprintf("tokens:%s:used", tenantID) }
+func (r *RedisStore) freshKey(tenantID string) string { return fmt.Sprintf("tokens:%s:fresh", tenantID) }
+func (r *RedisStore) inUseKey(tenantID string) string { return fmt.Sprintf("tokens:%s:in_use", tenantID) }
+func (r *RedisStore) usedKey(tenantID string) string  { return fmt.Sprintf("tokens:%s:used", tenantID) }
 
-// PopFreshTokens pops up to `count` tokens from fresh queue and moves them to in_use
+// PopFreshTokens pops up to `count` tokens from fresh queue and moves them to in_use.
+// Uses LMOVE for atomic transfer in a single round-trip per token.
 func (r *RedisStore) PopFreshTokens(ctx context.Context, tenantID string, count int) ([]TokenData, error) {
 	tokens := make([]TokenData, 0, count)
 
 	for i := 0; i < count; i++ {
-		val, err := r.client.LPop(ctx, freshKey(tenantID)).Result()
+		val, err := r.client.LMove(ctx, r.freshKey(tenantID), r.inUseKey(tenantID), "LEFT", "RIGHT").Result()
 		if err == redis.Nil {
 			break
 		}
 		if err != nil {
-			return tokens, fmt.Errorf("lpop failed: %w", err)
+			return tokens, fmt.Errorf("lmove failed: %w", err)
 		}
 
 		var token TokenData
@@ -58,58 +59,61 @@ func (r *RedisStore) PopFreshTokens(ctx context.Context, tenantID string, count 
 			continue
 		}
 
-		if err := r.client.RPush(ctx, inUseKey(tenantID), val).Err(); err != nil {
-			log.Printf("[WARN] failed to push to in_use: %v", err)
-		}
-
 		tokens = append(tokens, token)
 	}
 
 	return tokens, nil
 }
 
-// MarkExhausted moves a token from in_use to used queue with exhausted_at timestamp
-func (r *RedisStore) MarkExhausted(ctx context.Context, tenantID string, email string) error {
-	vals, err := r.client.LRange(ctx, inUseKey(tenantID), 0, -1).Result()
+// markExhaustedScript atomically finds a token by email in in_use, removes it,
+// stamps exhausted_at, and appends it to used. Returns 1 on success, 0 if not found.
+const markExhaustedScript = `
+local vals = redis.call('LRANGE', KEYS[1], 0, -1)
+for i, v in ipairs(vals) do
+    local t = cjson.decode(v)
+    if t.email == ARGV[1] then
+        redis.call('LREM', KEYS[1], 1, v)
+        t.exhausted_at = tonumber(ARGV[2])
+        redis.call('RPUSH', KEYS[2], cjson.encode(t))
+        return 1
+    end
+end
+return 0
+`
+
+// MarkExhausted moves a token from in_use to used queue with the given exhausted timestamp.
+// The operation is atomic via a Lua script to prevent duplicate entries under concurrency.
+func (r *RedisStore) MarkExhausted(ctx context.Context, tenantID string, email string, at time.Time) error {
+	script := redis.NewScript(markExhaustedScript)
+	result, err := script.Run(
+		ctx,
+		r.client,
+		[]string{r.inUseKey(tenantID), r.usedKey(tenantID)},
+		email,
+		at.Unix(),
+	).Int()
 	if err != nil {
-		return fmt.Errorf("lrange failed: %w", err)
+		return fmt.Errorf("mark exhausted script failed: %w", err)
 	}
-
-	for _, val := range vals {
-		var token TokenData
-		if err := json.Unmarshal([]byte(val), &token); err != nil {
-			continue
-		}
-
-		if token.Email == email {
-			r.client.LRem(ctx, inUseKey(tenantID), 1, val)
-
-			token.ExhaustedAt = TimeNow().Unix()
-			updatedJSON, err := json.Marshal(token)
-			if err != nil {
-				return fmt.Errorf("marshal failed: %w", err)
-			}
-			r.client.RPush(ctx, usedKey(tenantID), string(updatedJSON))
-			return nil
-		}
+	if result == 0 {
+		return fmt.Errorf("token not found for email: %s", email)
 	}
-
-	return fmt.Errorf("token not found for email: %s", email)
+	return nil
 }
 
 // GetStats returns queue lengths for a tenant
 func (r *RedisStore) GetStats(ctx context.Context, tenantID string) (StatsResponse, error) {
-	fresh, err := r.client.LLen(ctx, freshKey(tenantID)).Result()
+	fresh, err := r.client.LLen(ctx, r.freshKey(tenantID)).Result()
 	if err != nil {
-		return StatsResponse{}, err
+		return StatsResponse{}, fmt.Errorf("llen fresh failed: %w", err)
 	}
-	inUse, err := r.client.LLen(ctx, inUseKey(tenantID)).Result()
+	inUse, err := r.client.LLen(ctx, r.inUseKey(tenantID)).Result()
 	if err != nil {
-		return StatsResponse{}, err
+		return StatsResponse{}, fmt.Errorf("llen in_use failed: %w", err)
 	}
-	used, err := r.client.LLen(ctx, usedKey(tenantID)).Result()
+	used, err := r.client.LLen(ctx, r.usedKey(tenantID)).Result()
 	if err != nil {
-		return StatsResponse{}, err
+		return StatsResponse{}, fmt.Errorf("llen used failed: %w", err)
 	}
 
 	return StatsResponse{
@@ -132,6 +136,9 @@ func (r *RedisStore) GetAllTenants(ctx context.Context) ([]string, error) {
 		if start < end {
 			tenants[key[start:end]] = true
 		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan failed: %w", err)
 	}
 
 	result := make([]string, 0, len(tenants))

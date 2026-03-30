@@ -1,7 +1,5 @@
 package main
 
-import "time"
-
 // TokenData represents a token stored in Redis
 type TokenData struct {
 	Email        string `json:"email"`
@@ -35,6 +33,3 @@ type StatsResponse struct {
 type OKResponse struct {
 	OK bool `json:"ok"`
 }
-
-// TimeNow is a helper for testing
-var TimeNow = time.Now
