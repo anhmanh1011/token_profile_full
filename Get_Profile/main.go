@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -22,23 +23,28 @@ import (
 )
 
 func main() {
-	// Generate timestamp for this run
 	startTimestamp := time.Now().Format("2006-01-02_15-04-05")
 
 	// Parse command line arguments
 	emailsFile := flag.String("emails", "", "Path to emails file (default: emails.txt)")
-	tokensFile := flag.String("tokens", "", "Path to tokens file (default: tokens.txt)")
 	resultFile := flag.String("result", "", "Path to result file (will use timestamp if not specified)")
-	refreshedTokensFile := flag.String("refreshed", "tokens_refreshed.txt", "Path to save refreshed tokens")
+	queueSuffix := flag.String("queue", "", "Redis queue suffix (required, e.g. \"1\" -> redis-tokens-1)")
+	redisAddr := flag.String("redis", "localhost:6379", "Redis address")
+	numWorkers := flag.Int("workers", 350, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
-	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = unlimited)")
+	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	flag.Parse()
+
+	// Validate required flags
+	if *queueSuffix == "" {
+		fmt.Fprintln(os.Stderr, "Required flag: -queue (e.g. -queue 1)")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	// Generate timestamped filenames
 	logFileName := fmt.Sprintf("output_%s.log", startTimestamp)
 	resultFileName := fmt.Sprintf("result_%s.txt", startTimestamp)
-
-	// If result file specified, use it instead
 	if *resultFile != "" {
 		resultFileName = *resultFile
 	}
@@ -51,7 +57,6 @@ func main() {
 	}
 	defer logFile.Close()
 
-	// Log to both stdout and file
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -66,59 +71,65 @@ func main() {
 
 	// Load configuration
 	cfg := config.NewConfig()
-
-	// Override defaults for protection against rate limiting
-	cfg.NumWorkers = 350 // Reduced from 1000 to prevent account restriction
-	cfg.MaxCPM = 20000   // Limit to 20K requests/minute
-
-	// Override with command line arguments if provided
+	cfg.NumWorkers = *numWorkers
+	cfg.MaxCPM = 20000 // Hard limit: 20K CPM
+	cfg.RedisAddr = *redisAddr
+	cfg.RedisQueue = *queueSuffix
 	if *emailsFile != "" {
 		cfg.EmailsFile = *emailsFile
 	}
-	if *tokensFile != "" {
-		cfg.TokensFile = *tokensFile
-	}
-	// Use timestamped result file
 	cfg.ResultsFile = resultFileName
-
-	// Set max CPM if provided
 	if *maxCPM > 0 {
 		cfg.MaxCPM = *maxCPM
 	}
 
 	log.Printf("[CONFIG] Workers: %d | APITimeout: %ds | EmailBuffer: %d | MaxCPM: %d",
 		cfg.NumWorkers, cfg.APITimeout, cfg.EmailBufferSize, cfg.MaxCPM)
-	log.Printf("[FILES] Emails: %s | Tokens: %s | Result: %s",
-		cfg.EmailsFile, cfg.TokensFile, cfg.ResultsFile)
+	log.Printf("[CONFIG] Redis: %s | Queue: redis-tokens-%s", cfg.RedisAddr, cfg.RedisQueue)
+	log.Printf("[FILES] Emails: %s | Result: %s", cfg.EmailsFile, cfg.ResultsFile)
 
-	// Check if input files exist
+	// Check if emails file exists
 	if _, err := os.Stat(cfg.EmailsFile); os.IsNotExist(err) {
 		log.Fatalf("[ERROR] Emails file not found: %s", cfg.EmailsFile)
 	}
-	if _, err := os.Stat(cfg.TokensFile); os.IsNotExist(err) {
-		log.Fatalf("[ERROR] Tokens file not found: %s", cfg.TokensFile)
+
+	// Connect to Redis
+	redisLoader, err := token.NewRedisLoader(cfg.RedisAddr)
+	if err != nil {
+		log.Fatalf("[ERROR] %v", err)
+	}
+	defer redisLoader.Close()
+	log.Printf("[REDIS] Connected to %s", cfg.RedisAddr)
+
+	// Load tokens from Redis
+	tokenSlice, err := redisLoader.LoadTokens(cfg.RedisQueue)
+	if err != nil {
+		log.Fatalf("[ERROR] %v", err)
 	}
 
 	// Initialize token manager
 	tokenManager := token.NewManager()
-	if err := tokenManager.LoadFromFile(cfg.TokensFile); err != nil {
+	if err := tokenManager.LoadFromSlice(tokenSlice); err != nil {
 		log.Fatalf("[ERROR] Failed to load tokens: %v", err)
 	}
 	total, alive, _ := tokenManager.Stats()
 	log.Printf("[TOKEN] Loaded %d tokens (%d alive)", total, alive)
 
+	// Create dead token channel and set on manager
+	deadChan := make(chan string, 1000)
+	tokenManager.SetDeadChan(deadChan)
+
 	// Initialize token queue mode
 	tokenManager.InitQueue()
 	log.Printf("[TOKEN] Queue mode enabled, %d tokens in queue", tokenManager.QueueLen())
 
-	// Start refresh token saver
-	tokenManager.StartRefreshTokenSaver(*refreshedTokensFile)
-	log.Printf("[TOKEN] Refreshed tokens will be saved to: %s", *refreshedTokensFile)
+	// Start Redis dead token cleanup worker
+	ctx, cancel := context.WithCancel(context.Background())
+	redisLoader.StartCleanupWorker(ctx, cfg.RedisQueue, deadChan)
+	log.Printf("[REDIS] Dead token cleanup worker started")
 
 	// Initialize email reader
 	emailReader := reader.NewEmailReader(cfg.EmailsFile, cfg.FileBufferSize)
-
-	// Skip counting emails - too slow for large files
 	totalEmails := 0
 	log.Printf("[READER] Skipping email count for faster startup")
 
@@ -136,11 +147,7 @@ func main() {
 
 	// Initialize worker pool
 	pool := worker.NewPool(cfg.NumWorkers, apiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
-
-	// Start progress reporter
 	pool.StartProgressReporter(5*time.Second, totalEmails)
-
-	// Start workers
 	pool.Start()
 
 	// Set up graceful shutdown
@@ -151,7 +158,6 @@ func main() {
 	startTime := time.Now()
 	emailChan, errChan := emailReader.ReadEmails()
 
-	// Done channel to signal completion
 	done := make(chan struct{})
 	var closeOnce sync.Once
 	closeDone := func() {
@@ -160,21 +166,17 @@ func main() {
 		})
 	}
 
-	// Process emails from channel
 	go func() {
 		for email := range emailChan {
 			pool.Submit(email)
 		}
-		// Check for errors
 		if err := <-errChan; err != nil {
 			log.Printf("[ERROR] Failed to read emails: %v", err)
 		}
-		// Signal that all emails have been submitted
 		pool.Close()
 		closeDone()
 	}()
 
-	// Wait for completion or interrupt
 	go func() {
 		<-sigChan
 		log.Println("\n[SHUTDOWN] Received interrupt signal, shutting down...")
@@ -182,22 +184,13 @@ func main() {
 		closeDone()
 	}()
 
-	// Wait for processing to complete
 	<-done
-	time.Sleep(500 * time.Millisecond) // Give workers time to finish
+	time.Sleep(500 * time.Millisecond)
 
-	// Stop refresh token saver and flush remaining tokens
-	tokenManager.StopRefreshTokenSaver()
-	log.Printf("[TOKEN] Refreshed tokens saved to: %s", *refreshedTokensFile)
-
-	// Save alive tokens for next run
-	aliveTokensFile := "tokens_alive.txt"
-	aliveCount, err := tokenManager.SaveAliveTokens(aliveTokensFile)
-	if err != nil {
-		log.Printf("[TOKEN] Failed to save alive tokens: %v", err)
-	} else {
-		log.Printf("[TOKEN] Saved %d alive tokens to: %s", aliveCount, aliveTokensFile)
-	}
+	// Shutdown cleanup: stop cleanup worker, drain dead channel
+	cancel()
+	close(deadChan)
+	time.Sleep(1 * time.Second) // Give cleanup worker time to flush
 
 	// Print final statistics
 	elapsed := time.Since(startTime)
@@ -206,7 +199,6 @@ func main() {
 	fmt.Println(repeatString("=", 60))
 	log.Println("=== FINAL STATISTICS ===")
 
-	// Show stop reason
 	if pool.StoppedEarly() {
 		log.Printf("Stop Reason:     %s", pool.StopReason())
 	} else {
@@ -220,9 +212,10 @@ func main() {
 	log.Printf("ExactMatch:      %d", exactMatch)
 	log.Printf("Results Written: %d", resultWriter.Count())
 	log.Printf("Elapsed Time:    %s", elapsed.Round(time.Second))
-	log.Printf("Rate:            %.1f emails/second", float64(processed)/elapsed.Seconds())
+	if elapsed.Seconds() > 0 {
+		log.Printf("Rate:            %.1f emails/second", float64(processed)/elapsed.Seconds())
+	}
 
-	// Token stats
 	tTotal, tAlive, tDead := tokenManager.Stats()
 	log.Printf("Tokens:          %d total, %d alive, %d dead", tTotal, tAlive, tDead)
 
@@ -236,7 +229,6 @@ func main() {
 	}
 }
 
-// repeatString returns a string repeated n times
 func repeatString(s string, n int) string {
 	result := ""
 	for i := 0; i < n; i++ {
