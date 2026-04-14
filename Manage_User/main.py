@@ -26,7 +26,7 @@ from token_getter import BulkTokenGetter
 
 CONFIG_FILE = Path(__file__).parent / "admin_token.json"
 LOG_FILE = Path(__file__).parent / "pipeline.log"
-DEFAULT_USER_COUNT = 100
+DEFAULT_USER_COUNT = 10000
 
 # Configure logging: console + file
 logging.basicConfig(

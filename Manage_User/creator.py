@@ -24,7 +24,7 @@ GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 DEFAULT_COUNT = 10000
 BATCH_SIZE = 20
-WORKERS = 4
+WORKERS = 2
 DELAY_BETWEEN_BATCHES = 1.5
 
 FIRST_NAMES = [
@@ -158,6 +158,11 @@ class BulkUserCreator:
 
     def _process_batch(self, users: list[dict], retry: int = 0) -> list[dict]:
         if retry > 3:
+            logger.warning(
+                "Max retries reached for batch of %d users (first: %s)",
+                len(users),
+                users[0]["userPrincipalName"] if users else "?",
+            )
             return [
                 {
                     "email": u["userPrincipalName"],
@@ -234,17 +239,29 @@ class BulkUserCreator:
                     elif response["status"] == 429:
                         retry_users.append(user)
                     else:
-                        error = (
+                        error_code = (
                             response.get("body", {})
                             .get("error", {})
-                            .get("message", "Unknown")[:80]
+                            .get("code", "Unknown")
+                        )
+                        error_msg = (
+                            response.get("body", {})
+                            .get("error", {})
+                            .get("message", "Unknown")[:120]
+                        )
+                        logger.warning(
+                            "User create failed [%d]: %s - %s (%s)",
+                            response["status"],
+                            error_code,
+                            error_msg,
+                            user["userPrincipalName"],
                         )
                         results.append(
                             {
                                 "email": user["userPrincipalName"],
                                 "password": user["_password"],
                                 "success": False,
-                                "error": error,
+                                "error": error_msg,
                             }
                         )
             else:

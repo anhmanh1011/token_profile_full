@@ -7,6 +7,11 @@ admin_token.json
 # Runtime data
 *.log
 backup/
+*.exe
+result_*.txt
+emails.txt
+output_*.log
 
 # Claude Code local config
 .claude/
+*.bak

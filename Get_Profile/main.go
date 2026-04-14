@@ -30,7 +30,7 @@ func main() {
 	resultFile := flag.String("result", "", "Path to result file (will use timestamp if not specified)")
 	queueSuffix := flag.String("queue", "", "Redis queue suffix (required, e.g. \"1\" -> redis-tokens-1)")
 	redisAddr := flag.String("redis", "localhost:6379", "Redis address")
-	numWorkers := flag.Int("workers", 350, "Number of workers")
+	numWorkers := flag.Int("workers", 550, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	flag.Parse()
