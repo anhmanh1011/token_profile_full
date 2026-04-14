@@ -32,7 +32,7 @@ class FastBulkDeleter:
     def __init__(
         self,
         admin: dict,
-        queue_suffix: str,
+        queue_suffix: str = "",
         workers: int = DEFAULT_WORKERS,
         auto_confirm: bool = False,
     ):
@@ -57,10 +57,12 @@ class FastBulkDeleter:
         self.skipped_admins = 0
         self.stats_lock = threading.Lock()
 
-        # Redis client for reading app-created users
-        self.redis_client = redis_lib.Redis(
-            host="localhost", port=6379, db=0, decode_responses=True
-        )
+        # Redis client for reading app-created users (optional)
+        self.redis_client = None
+        if queue_suffix:
+            self.redis_client = redis_lib.Redis(
+                host="localhost", port=6379, db=0, decode_responses=True
+            )
 
         # Session with connection pooling
         self.session = requests.Session()
@@ -151,6 +153,8 @@ class FastBulkDeleter:
 
     def _get_redis_users(self) -> list[str]:
         """Fetch app-created emails from Redis Hash redis-users-{N}."""
+        if not self.redis_client:
+            return []
         queue_name = f"redis-users-{self.queue_suffix}"
         try:
             data = self.redis_client.hgetall(queue_name)
@@ -410,7 +414,7 @@ class FastBulkDeleter:
         )
 
         # Clear Redis queue -- users no longer exist
-        if self.deleted > 0:
+        if self.deleted > 0 and self.redis_client:
             queue_name = f"redis-users-{self.queue_suffix}"
             try:
                 self.redis_client.delete(queue_name)
