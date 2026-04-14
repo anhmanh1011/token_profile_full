@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
 BATCH_SIZE = 20
-DEFAULT_WORKERS = 3
+DEFAULT_WORKERS = 2
 DELAY_BETWEEN_BATCHES = 2.0
 
 
@@ -207,6 +207,11 @@ class FastBulkDeleter:
     def _process_batch(self, emails: list[str], retry: int = 0) -> list[dict]:
         """Process a batch of user deletions with retry on throttle."""
         if retry > 3:
+            logger.warning(
+                "Max retries reached for batch of %d users (first: %s)",
+                len(emails),
+                emails[0] if emails else "?",
+            )
             return [
                 {"email": e, "success": False, "error": "Max retries"}
                 for e in emails
@@ -242,6 +247,10 @@ class FastBulkDeleter:
 
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 5))
+                logger.warning(
+                    "Batch throttled (429), retry %d/3, waiting %ds...",
+                    retry + 1, retry_after,
+                )
                 time.sleep(min(retry_after, 30))
                 return self._process_batch(emails, retry + 1)
 
@@ -256,15 +265,30 @@ class FastBulkDeleter:
                     elif response["status"] == 429:
                         retry_users.append(email)
                     else:
-                        error = (
+                        error_code = (
                             response.get("body", {})
                             .get("error", {})
-                            .get("message", "Unknown error")[:100]
+                            .get("code", "Unknown")
+                        )
+                        error_msg = (
+                            response.get("body", {})
+                            .get("error", {})
+                            .get("message", "Unknown error")[:120]
+                        )
+                        logger.warning(
+                            "User delete failed [%d]: %s - %s (%s)",
+                            response["status"],
+                            error_code,
+                            error_msg,
+                            email,
                         )
                         results.append(
-                            {"email": email, "success": False, "error": error}
+                            {"email": email, "success": False, "error": error_msg}
                         )
             else:
+                logger.error(
+                    "Batch failed: HTTP %d - %s", resp.status_code, resp.text[:200]
+                )
                 for email in emails:
                     results.append(
                         {
