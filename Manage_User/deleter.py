@@ -1,11 +1,8 @@
 """
-Fast Bulk User Deleter — Delete all normal (non-admin) users from a Microsoft 365 tenant.
+Fast Bulk User Deleter — Delete app-created users from a Microsoft 365 tenant.
 
-Refactored from delete_fast.py:
-- Accepts admin dict directly (no file I/O)
-- Returns results dict instead of writing log files
-- Supports auto_confirm for pipeline mode
-- Cross-platform (no colorama dependency)
+Only deletes users found in Redis queue (redis-users-{N}), not all tenant users.
+Admin users are still protected as a safety net.
 """
 import logging
 import queue
@@ -13,6 +10,7 @@ import threading
 import time
 from typing import Optional
 
+import redis as redis_lib
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -26,11 +24,15 @@ DELAY_BETWEEN_BATCHES = 2.0
 
 
 class FastBulkDeleter:
-    """Delete all normal users from a Microsoft 365 tenant via Graph Batch API."""
+    """Delete app-created users from a Microsoft 365 tenant via Graph Batch API.
+
+    Uses Redis redis-users-{N} as source of truth for which users to delete.
+    """
 
     def __init__(
         self,
         admin: dict,
+        queue_suffix: str,
         workers: int = DEFAULT_WORKERS,
         auto_confirm: bool = False,
     ):
@@ -38,6 +40,7 @@ class FastBulkDeleter:
         self.refresh_token = admin.get("refresh_token", "")
         self.tenant_id = admin.get("tenant_id", "common")
         self.domain = admin.get("domain", "")
+        self.queue_suffix = queue_suffix
         self.workers = workers
         self.auto_confirm = auto_confirm
 
@@ -53,6 +56,11 @@ class FastBulkDeleter:
         self.failed = 0
         self.skipped_admins = 0
         self.stats_lock = threading.Lock()
+
+        # Redis client for reading app-created users
+        self.redis_client = redis_lib.Redis(
+            host="localhost", port=6379, db=0, decode_responses=True
+        )
 
         # Session with connection pooling
         self.session = requests.Session()
@@ -141,58 +149,17 @@ class FastBulkDeleter:
 
         return admin_emails
 
-    def _get_all_users(self) -> list[str]:
-        """Fetch all user emails from tenant."""
-        all_users: list[str] = []
-        token = self._get_token()
-        if not token:
-            logger.error("Cannot get token to fetch users")
-            return all_users
-
-        headers = {"Authorization": f"Bearer {token}"}
-        url: Optional[str] = (
-            f"{GRAPH_URL}/users?$select=userPrincipalName&$top=999"
-        )
-        page_count = 0
-
-        while url:
-            try:
-                resp = self.session.get(url, headers=headers, timeout=60)
-
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 5))
-                    logger.warning("Rate limited, waiting %ds...", retry_after)
-                    time.sleep(retry_after)
-                    continue
-
-                if resp.status_code != 200:
-                    logger.error(
-                        "Failed to get users: %d - %s",
-                        resp.status_code,
-                        resp.text[:200],
-                    )
-                    break
-
-                data = resp.json()
-                for user in data.get("value", []):
-                    email = user.get("userPrincipalName", "").lower()
-                    if email:
-                        all_users.append(email)
-
-                page_count += 1
-                logger.info(
-                    "Page %d: fetched %d users (total: %d)",
-                    page_count,
-                    len(data.get("value", [])),
-                    len(all_users),
-                )
-                url = data.get("@odata.nextLink")
-
-            except requests.RequestException as e:
-                logger.error("Error fetching users: %s", e)
-                break
-
-        return all_users
+    def _get_redis_users(self) -> list[str]:
+        """Fetch app-created emails from Redis Hash redis-users-{N}."""
+        queue_name = f"redis-users-{self.queue_suffix}"
+        try:
+            data = self.redis_client.hgetall(queue_name)
+            emails = [email.lower() for email in data.keys()]
+            logger.info("Got %d emails from Redis '%s'", len(emails), queue_name)
+            return emails
+        except Exception as e:
+            logger.error("Failed to read Redis '%s': %s", queue_name, e)
+            return []
 
     def _filter_non_admin_users(self, users: list[str]) -> list[str]:
         """Filter out admin users from deletion list."""
@@ -369,20 +336,28 @@ class FastBulkDeleter:
             sorted(self.admin_emails),
         )
 
-        # Fetch all users
-        all_users = self._get_all_users()
-        logger.info("Total users in tenant: %d", len(all_users))
+        # Fetch app-created users from Redis
+        all_users = self._get_redis_users()
+        if not all_users:
+            logger.info("No users in Redis queue -- nothing to delete.")
+            return {
+                "deleted": 0,
+                "failed": 0,
+                "skipped_admins": 0,
+                "new_refresh_token": self.new_refresh_token,
+            }
 
-        # Filter out admins
+        # Filter out admins as safety net
         users = self._filter_non_admin_users(all_users)
         logger.info(
-            "Admin (protected): %d | Normal (to delete): %d",
+            "Redis users: %d | Admin (protected): %d | To delete: %d",
+            len(all_users),
             self.skipped_admins,
             len(users),
         )
 
         if not users:
-            logger.info("No normal users to delete!")
+            logger.info("All Redis users are admins -- nothing to delete.")
             return {
                 "deleted": 0,
                 "failed": 0,
@@ -433,6 +408,15 @@ class FastBulkDeleter:
             elapsed,
             rate,
         )
+
+        # Clear Redis queue -- users no longer exist
+        if self.deleted > 0:
+            queue_name = f"redis-users-{self.queue_suffix}"
+            try:
+                self.redis_client.delete(queue_name)
+                logger.info("Cleared Redis queue '%s' after deletion", queue_name)
+            except Exception as e:
+                logger.warning("Failed to clear Redis queue '%s': %s", queue_name, e)
 
         return {
             "deleted": self.deleted,

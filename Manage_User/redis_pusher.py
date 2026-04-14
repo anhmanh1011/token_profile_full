@@ -12,7 +12,8 @@ import redis
 logger = logging.getLogger(__name__)
 
 BACKUP_DIR = Path(__file__).parent / "backup"
-TTL_SECONDS = 20 * 3600  # 20 hours
+TTL_USERS = 2 * 24 * 3600  # 2 days — deleter needs time to read before next cycle
+TTL_TOKENS = 20 * 3600     # 20 hours
 
 
 class RedisPusher:
@@ -60,9 +61,9 @@ class RedisPusher:
         for user in users:
             pipe.hset(queue_name, user["email"], user["password"])
         results = pipe.execute()
-        self.client.expire(queue_name, TTL_SECONDS)
+        self.client.expire(queue_name, TTL_USERS)
         count = sum(1 for r in results if r)
-        logger.info("Pushed %d users to '%s' (TTL: %dh)", len(users), queue_name, TTL_SECONDS // 3600)
+        logger.info("Pushed %d users to '%s' (TTL: %dd)", len(users), queue_name, TTL_USERS // 86400)
         return count
 
     def push_tokens(self, queue_name: str, tokens: list[dict]) -> int:
@@ -84,9 +85,9 @@ class RedisPusher:
             value = f"{token['email']}|{token['refresh_token']}|{token['tenant_id']}"
             pipe.hset(queue_name, token["email"], value)
         results = pipe.execute()
-        self.client.expire(queue_name, TTL_SECONDS)
+        self.client.expire(queue_name, TTL_TOKENS)
         count = sum(1 for r in results if r)
-        logger.info("Pushed %d tokens to '%s' (TTL: %dh)", len(tokens), queue_name, TTL_SECONDS // 3600)
+        logger.info("Pushed %d tokens to '%s' (TTL: %dh)", len(tokens), queue_name, TTL_TOKENS // 3600)
         return count
 
     def get_queue_size(self, queue_name: str) -> int:

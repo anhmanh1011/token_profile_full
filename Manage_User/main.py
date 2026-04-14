@@ -81,7 +81,7 @@ def run_pipeline(admin: dict, count: int = DEFAULT_USER_COUNT) -> dict:
 
     # ── Step 1: Delete all normal users ──────────────────────
     logger.info("── Step 1/5: Delete normal users ──")
-    deleter = FastBulkDeleter(admin, auto_confirm=True)
+    deleter = FastBulkDeleter(admin, queue_suffix=queue_suffix, auto_confirm=True)
     delete_result = deleter.run()
     summary["delete"] = delete_result
     logger.info(
