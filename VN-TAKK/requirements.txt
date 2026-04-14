@@ -1,4 +1,0 @@
-colorama==0.4.6
-curl_cffi==0.10.0
-requests==2.32.3
-redis==5.2.1

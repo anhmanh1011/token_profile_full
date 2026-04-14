@@ -1,4 +1,12 @@
-CHECK_CONNECTION/check_connection
-token-api/token-api
 __pycache__/
 *.pyc
+
+# Credentials
+admin_token.json
+
+# Runtime data
+*.log
+backup/
+
+# Claude Code local config
+.claude/
