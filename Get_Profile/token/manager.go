@@ -107,6 +107,19 @@ func (m *Manager) LoadFromSlice(tokens []*TokenInfo) error {
 	return nil
 }
 
+// AddToken adds a single token to the manager and pushes it to the queue
+// if queue mode is active. Used for lazy loading from API.
+func (m *Manager) AddToken(t *TokenInfo) {
+	m.tokenInfos = append(m.tokenInfos, t)
+	atomic.AddInt32(&m.totalTokens, 1)
+	if m.queueMode && m.tokenQueue != nil {
+		select {
+		case m.tokenQueue <- t:
+		default:
+		}
+	}
+}
+
 // LoadFromFile loads tokens from a file
 func (m *Manager) LoadFromFile(filepath string) error {
 	file, err := os.Open(filepath)
@@ -441,6 +454,13 @@ func (m *Manager) InitQueue() {
 			m.tokenQueue <- token
 		}
 	}
+}
+
+// InitEmptyQueue initializes queue mode with an empty queue.
+// Tokens are added later via AddToken().
+func (m *Manager) InitEmptyQueue(bufferSize int) {
+	m.tokenQueue = make(chan *TokenInfo, bufferSize)
+	m.queueMode = true
 }
 
 // AcquireToken gets a token from queue (blocks if empty)
