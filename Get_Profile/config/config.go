@@ -5,15 +5,14 @@ type Config struct {
 	EmailsFile  string
 	ResultsFile string
 
-	// Redis settings
-	RedisAddr  string
-	RedisQueue string // Queue suffix, e.g. "1" -> redis-tokens-1
+	// API settings
+	APIAddr string // Python API service address
 
 	// Worker settings
 	NumWorkers int
 	MaxWorkers int
 
-	// API settings
+	// Worker API settings
 	APITimeout int // seconds
 
 	// Rate limiting
@@ -34,15 +33,14 @@ func NewConfig() *Config {
 		EmailsFile:  "emails.txt",
 		ResultsFile: "result.txt",
 
-		// Redis settings
-		RedisAddr:  "localhost:6379",
-		RedisQueue: "",
+		// API settings
+		APIAddr: "http://localhost:5000",
 
 		// Worker settings
 		NumWorkers: numWorkers,
 		MaxWorkers: maxWorkers,
 
-		// API settings
+		// Worker API settings
 		APITimeout: 30,
 
 		// Rate limiting (default 35K CPM, overridden in main.go to 20K)
