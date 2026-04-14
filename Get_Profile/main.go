@@ -28,19 +28,11 @@ func main() {
 	// Parse command line arguments
 	emailsFile := flag.String("emails", "", "Path to emails file (default: emails.txt)")
 	resultFile := flag.String("result", "", "Path to result file (will use timestamp if not specified)")
-	queueSuffix := flag.String("queue", "", "Redis queue suffix (required, e.g. \"1\" -> redis-tokens-1)")
-	redisAddr := flag.String("redis", "localhost:6379", "Redis address")
+	apiAddr := flag.String("api", "", "Python API service address (default: http://localhost:5000)")
 	numWorkers := flag.Int("workers", 550, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	flag.Parse()
-
-	// Validate required flags
-	if *queueSuffix == "" {
-		fmt.Fprintln(os.Stderr, "Required flag: -queue (e.g. -queue 1)")
-		flag.Usage()
-		os.Exit(1)
-	}
 
 	// Generate timestamped filenames
 	logFileName := fmt.Sprintf("output_%s.log", startTimestamp)
@@ -73,8 +65,9 @@ func main() {
 	cfg := config.NewConfig()
 	cfg.NumWorkers = *numWorkers
 	cfg.MaxCPM = 20000 // Hard limit: 20K CPM
-	cfg.RedisAddr = *redisAddr
-	cfg.RedisQueue = *queueSuffix
+	if *apiAddr != "" {
+		cfg.APIAddr = *apiAddr
+	}
 	if *emailsFile != "" {
 		cfg.EmailsFile = *emailsFile
 	}
@@ -85,7 +78,7 @@ func main() {
 
 	log.Printf("[CONFIG] Workers: %d | APITimeout: %ds | EmailBuffer: %d | MaxCPM: %d",
 		cfg.NumWorkers, cfg.APITimeout, cfg.EmailBufferSize, cfg.MaxCPM)
-	log.Printf("[CONFIG] Redis: %s | Queue: redis-tokens-%s", cfg.RedisAddr, cfg.RedisQueue)
+	log.Printf("[CONFIG] API: %s", cfg.APIAddr)
 	log.Printf("[FILES] Emails: %s | Result: %s", cfg.EmailsFile, cfg.ResultsFile)
 
 	// Check if emails file exists
@@ -93,40 +86,85 @@ func main() {
 		log.Fatalf("[ERROR] Emails file not found: %s", cfg.EmailsFile)
 	}
 
-	// Connect to Redis
-	redisLoader, err := token.NewRedisLoader(cfg.RedisAddr)
-	if err != nil {
-		log.Fatalf("[ERROR] %v", err)
-	}
-	defer redisLoader.Close()
-	log.Printf("[REDIS] Connected to %s", cfg.RedisAddr)
+	// Create API client for token fetching and user deletion
+	apiClient := token.NewAPIClient(cfg.APIAddr)
+	log.Printf("[API] Token API client initialized: %s", cfg.APIAddr)
 
-	// Load tokens from Redis
-	tokenSlice, err := redisLoader.LoadTokens(cfg.RedisQueue)
-	if err != nil {
-		log.Fatalf("[ERROR] %v", err)
-	}
-
-	// Initialize token manager
+	// Initialize token manager with empty queue
 	tokenManager := token.NewManager()
-	if err := tokenManager.LoadFromSlice(tokenSlice); err != nil {
-		log.Fatalf("[ERROR] Failed to load tokens: %v", err)
+	tokenManager.InitEmptyQueue(2000)
+	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
+
+	// Pre-fetch initial batch of tokens
+	const prefetchCount = 50
+	fetched := 0
+	for fetched < prefetchCount {
+		t, err := apiClient.FetchToken()
+		if err != nil {
+			log.Printf("[TOKEN] Pre-fetch error after %d tokens: %v", fetched, err)
+			break
+		}
+		if t == nil {
+			// 202: queue temporarily empty, wait and retry
+			log.Printf("[TOKEN] Pre-fetch: API queue empty, waiting 2s... (%d/%d fetched)", fetched, prefetchCount)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		tokenManager.AddToken(t)
+		fetched++
 	}
-	total, alive, _ := tokenManager.Stats()
-	log.Printf("[TOKEN] Loaded %d tokens (%d alive)", total, alive)
+	if fetched == 0 {
+		log.Fatalf("[ERROR] Failed to pre-fetch any tokens from API")
+	}
+	log.Printf("[TOKEN] Pre-fetched %d tokens, queue length: %d", fetched, tokenManager.QueueLen())
 
 	// Create dead token channel and set on manager
 	deadChan := make(chan string, 1000)
 	tokenManager.SetDeadChan(deadChan)
 
-	// Initialize token queue mode
-	tokenManager.InitQueue()
-	log.Printf("[TOKEN] Queue mode enabled, %d tokens in queue", tokenManager.QueueLen())
+	// Bridge: deadChan → apiClient.QueueDelete
+	go func() {
+		for email := range deadChan {
+			apiClient.QueueDelete(email)
+		}
+	}()
 
-	// Start Redis dead token cleanup worker
-	ctx, cancel := context.WithCancel(context.Background())
-	redisLoader.StartCleanupWorker(ctx, cfg.RedisQueue, deadChan)
-	log.Printf("[REDIS] Dead token cleanup worker started")
+	// Start delete worker
+	deleteCtx, deleteCancel := context.WithCancel(context.Background())
+	var deleteWg sync.WaitGroup
+	deleteWg.Add(1)
+	apiClient.StartDeleteWorker(deleteCtx, &deleteWg)
+	log.Println("[API] Delete worker started")
+
+	// Background token fetcher goroutine
+	fetchCtx, fetchCancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			select {
+			case <-fetchCtx.Done():
+				return
+			default:
+			}
+
+			if tokenManager.QueueLen() < 50 {
+				t, err := apiClient.FetchToken()
+				if err != nil {
+					log.Printf("[TOKEN] Background fetch error: %v", err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				if t == nil {
+					// 202: queue empty, wait before retry
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				tokenManager.AddToken(t)
+			} else {
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+	log.Println("[TOKEN] Background token fetcher started")
 
 	// Initialize email reader
 	emailReader := reader.NewEmailReader(cfg.EmailsFile, cfg.FileBufferSize)
@@ -141,12 +179,12 @@ func main() {
 	defer resultWriter.Close()
 	log.Printf("[WRITER] Output file: %s", cfg.ResultsFile)
 
-	// Initialize API client
-	apiClient := api.NewClient(cfg.APITimeout)
-	log.Println("[API] Client initialized")
+	// Initialize Loki API client
+	lokiClient := api.NewClient(cfg.APITimeout)
+	log.Println("[API] Loki client initialized")
 
 	// Initialize worker pool
-	pool := worker.NewPool(cfg.NumWorkers, apiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
+	pool := worker.NewPool(cfg.NumWorkers, lokiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
 	pool.StartProgressReporter(5*time.Second, totalEmails)
 	pool.Start()
 
@@ -187,10 +225,12 @@ func main() {
 	<-done
 	time.Sleep(500 * time.Millisecond)
 
-	// Shutdown cleanup: stop cleanup worker, drain dead channel
-	cancel()
+	// Shutdown cleanup
+	fetchCancel()
 	close(deadChan)
-	time.Sleep(1 * time.Second) // Give cleanup worker time to flush
+	apiClient.CloseDeleteChan()
+	deleteCancel()
+	deleteWg.Wait()
 
 	// Print final statistics
 	elapsed := time.Since(startTime)
