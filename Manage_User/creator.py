@@ -85,15 +85,14 @@ class BulkUserCreator:
         return "".join(password)
 
     def _generate_user_data(self) -> dict:
-        first = random.choice(FIRST_NAMES).lower()
-        last = random.choice(LAST_NAMES).lower()
-        num = random.randint(1000, 9999)
-        username = f"{first}.{last}{num}"
+        # bot_ prefix for easy identification and cleanup
+        random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        username = f"bot_{random_id}"
         password = self._generate_password()
 
         return {
             "userPrincipalName": f"{username}@{self.domain}",
-            "displayName": f"{first.title()} {last.title()}",
+            "displayName": f"Bot {random_id}",
             "mailNickname": username,
             "accountEnabled": True,
             "usageLocation": "US",
