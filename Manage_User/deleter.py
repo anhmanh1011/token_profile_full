@@ -12,12 +12,12 @@ from typing import Optional
 
 import redis as redis_lib
 import requests
-from requests.adapters import HTTPAdapter
+
+from admin_token_manager import AdminTokenManager
 
 logger = logging.getLogger(__name__)
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
-CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
 BATCH_SIZE = 20
 DEFAULT_WORKERS = 2
 DELAY_BETWEEN_BATCHES = 2.0
@@ -31,23 +31,16 @@ class FastBulkDeleter:
 
     def __init__(
         self,
-        admin: dict,
+        token_mgr: AdminTokenManager,
         queue_suffix: str = "",
         workers: int = DEFAULT_WORKERS,
         auto_confirm: bool = False,
     ):
-        self.username = admin.get("username", "")
-        self.refresh_token = admin.get("refresh_token", "")
-        self.tenant_id = admin.get("tenant_id", "common")
-        self.domain = admin.get("domain", "")
+        self.token_mgr = token_mgr
+        self.domain = token_mgr.domain
         self.queue_suffix = queue_suffix
         self.workers = workers
         self.auto_confirm = auto_confirm
-
-        self.access_token: Optional[str] = None
-        self.token_expires: float = 0
-        self.token_lock = threading.Lock()
-        self.new_refresh_token: Optional[str] = None
 
         self.admin_emails: set[str] = set()
 
@@ -57,50 +50,15 @@ class FastBulkDeleter:
         self.skipped_admins = 0
         self.stats_lock = threading.Lock()
 
-        # Redis client for reading app-created users (optional)
+        # Redis client (optional)
         self.redis_client = None
         if queue_suffix:
             self.redis_client = redis_lib.Redis(
                 host="localhost", port=6379, db=0, decode_responses=True
             )
 
-        # Session with connection pooling
-        self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=3)
-        self.session.mount("https://", adapter)
-
     def _get_token(self) -> Optional[str]:
-        with self.token_lock:
-            if self.access_token and time.time() < self.token_expires:
-                return self.access_token
-
-            data = {
-                "client_id": CLIENT_ID,
-                "scope": "https://graph.microsoft.com/.default offline_access",
-                "refresh_token": self.refresh_token,
-                "grant_type": "refresh_token",
-            }
-            token_url = (
-                f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
-            )
-
-            try:
-                resp = self.session.post(token_url, data=data, timeout=30)
-                if resp.status_code == 200:
-                    token_data = resp.json()
-                    self.access_token = token_data["access_token"]
-                    if "refresh_token" in token_data:
-                        self.new_refresh_token = token_data["refresh_token"]
-                        self.refresh_token = token_data["refresh_token"]
-                    self.token_expires = (
-                        time.time() + token_data.get("expires_in", 3600) - 300
-                    )
-                    return self.access_token
-                else:
-                    logger.error("Token error: %s", resp.text[:200])
-            except requests.RequestException as e:
-                logger.error("Token request failed: %s", e)
-            return None
+        return self.token_mgr.get_token()
 
     def _get_admin_users(self) -> set[str]:
         """Fetch all users with admin directory roles."""
@@ -113,7 +71,7 @@ class FastBulkDeleter:
         headers = {"Authorization": f"Bearer {token}"}
 
         try:
-            resp = self.session.get(
+            resp = self.token_mgr.session.get(
                 f"{GRAPH_URL}/directoryRoles", headers=headers, timeout=30
             )
             if resp.status_code != 200:
@@ -127,7 +85,7 @@ class FastBulkDeleter:
                 role_id = role["id"]
                 role_name = role.get("displayName", "Unknown")
                 try:
-                    members_resp = self.session.get(
+                    members_resp = self.token_mgr.session.get(
                         f"{GRAPH_URL}/directoryRoles/{role_id}/members",
                         headers=headers,
                         timeout=30,
@@ -209,7 +167,7 @@ class FastBulkDeleter:
         retry_users = []
 
         try:
-            resp = self.session.post(
+            resp = self.token_mgr.session.post(
                 f"{GRAPH_URL}/$batch",
                 headers=headers,
                 json=batch_data,
@@ -319,7 +277,7 @@ class FastBulkDeleter:
              "new_refresh_token": str | None}
         """
         logger.info("=== Delete Normal Users: %s ===", self.domain)
-        logger.info("Admin: %s | Workers: %d", self.username, self.workers)
+        logger.info("Domain: %s | Workers: %d", self.domain, self.workers)
 
         # Auth
         if not self._get_token():
@@ -348,7 +306,7 @@ class FastBulkDeleter:
                 "deleted": 0,
                 "failed": 0,
                 "skipped_admins": 0,
-                "new_refresh_token": self.new_refresh_token,
+                "new_refresh_token": None,
             }
 
         # Filter out admins as safety net
@@ -366,7 +324,7 @@ class FastBulkDeleter:
                 "deleted": 0,
                 "failed": 0,
                 "skipped_admins": self.skipped_admins,
-                "new_refresh_token": self.new_refresh_token,
+                "new_refresh_token": None,
             }
 
         # Confirmation
@@ -380,7 +338,7 @@ class FastBulkDeleter:
                     "deleted": 0,
                     "failed": 0,
                     "skipped_admins": self.skipped_admins,
-                    "new_refresh_token": self.new_refresh_token,
+                    "new_refresh_token": None,
                 }
 
         # Create batches and process
@@ -426,5 +384,5 @@ class FastBulkDeleter:
             "deleted": self.deleted,
             "failed": self.failed,
             "skipped_admins": self.skipped_admins,
-            "new_refresh_token": self.new_refresh_token,
+            "new_refresh_token": None,
         }

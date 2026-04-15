@@ -55,6 +55,7 @@ class TeamOutLook:
 
         # Results
         self.refresh_token: Optional[str] = None
+        self.access_token: Optional[str] = None
         self.final_password: Optional[str] = None
 
     def clear_cookies(self) -> None:
@@ -456,7 +457,7 @@ class TeamOutLook:
             logger.debug("%s - No access_token in exchange response", self.mail)
             return False
 
-        self.refresh_token = rf
+        self.access_token = response.json()["access_token"]
         logger.info("%s - Token obtained (tenant: %s)", self.mail, self.tenant_id)
         return True
 
@@ -536,7 +537,7 @@ class BulkTokenGetter:
                         self.tokens.append(
                             {
                                 "email": user["email"],
-                                "refresh_token": obj.refresh_token,
+                                "access_token": obj.access_token,
                                 "tenant_id": obj.tenant_id,
                             }
                         )

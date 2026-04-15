@@ -3,7 +3,7 @@ Bulk User Creator — Create Microsoft 365 users via Graph Batch API.
 
 Refactored from create_user.py:
 - Returns created_users list instead of writing to file
-- Accepts admin dict directly (no file I/O, no argparse)
+- Delegates token management to shared AdminTokenManager
 - Cross-platform compatible
 """
 import logging
@@ -15,7 +15,8 @@ import time
 from typing import Optional
 
 import requests
-from requests.adapters import HTTPAdapter
+
+from admin_token_manager import AdminTokenManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +47,14 @@ class BulkUserCreator:
 
     def __init__(
         self,
-        admin: dict,
+        token_mgr: AdminTokenManager,
         count: int = DEFAULT_COUNT,
         license_sku: Optional[str] = None,
     ):
-        self.tenant_id = admin["tenant_id"]
-        self.refresh_token = admin["refresh_token"]
-        self.domain = admin["domain"]
+        self.token_mgr = token_mgr
+        self.domain = token_mgr.domain
         self.count = count
         self.license_sku = license_sku
-
-        self.access_token: Optional[str] = None
-        self.token_expires: float = 0
-        self.token_lock = threading.Lock()
 
         # Results
         self.created_users: list[dict] = []
@@ -66,13 +62,6 @@ class BulkUserCreator:
         self.licensed_count = 0
         self.failed_count = 0
         self.stats_lock = threading.Lock()
-
-        self.new_refresh_token: Optional[str] = None
-
-        # Session with connection pooling
-        self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
-        self.session.mount("https://", adapter)
 
     @staticmethod
     def _generate_password() -> str:
@@ -104,36 +93,7 @@ class BulkUserCreator:
         }
 
     def _get_token(self) -> Optional[str]:
-        with self.token_lock:
-            if self.access_token and time.time() < self.token_expires:
-                return self.access_token
-
-            token_url = (
-                f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
-            )
-            data = {
-                "client_id": CLIENT_ID,
-                "scope": "https://graph.microsoft.com/.default offline_access",
-                "refresh_token": self.refresh_token,
-                "grant_type": "refresh_token",
-            }
-
-            try:
-                resp = self.session.post(token_url, data=data, timeout=30)
-                if resp.status_code == 200:
-                    token_data = resp.json()
-                    self.access_token = token_data["access_token"]
-                    self.token_expires = (
-                        time.time() + token_data.get("expires_in", 3600) - 300
-                    )
-                    if "refresh_token" in token_data:
-                        self.new_refresh_token = token_data["refresh_token"]
-                    return self.access_token
-                else:
-                    logger.error("Token failed: %s", resp.text[:200])
-            except requests.RequestException as e:
-                logger.error("Token request failed: %s", e)
-            return None
+        return self.token_mgr.get_token()
 
     def _get_available_license(self) -> Optional[str]:
         token = self._get_token()
@@ -142,7 +102,7 @@ class BulkUserCreator:
 
         headers = {"Authorization": f"Bearer {token}"}
         try:
-            resp = self.session.get(
+            resp = self.token_mgr.session.get(
                 f"{GRAPH_URL}/subscribedSkus", headers=headers, timeout=30
             )
             if resp.status_code == 200:
@@ -207,7 +167,7 @@ class BulkUserCreator:
         retry_users = []
 
         try:
-            resp = self.session.post(
+            resp = self.token_mgr.session.post(
                 f"{GRAPH_URL}/$batch",
                 headers=headers,
                 json=batch_data,
@@ -321,7 +281,7 @@ class BulkUserCreator:
         ]
 
         try:
-            resp = self.session.post(
+            resp = self.token_mgr.session.post(
                 f"{GRAPH_URL}/$batch",
                 headers=headers,
                 json={"requests": requests_list},
@@ -453,5 +413,5 @@ class BulkUserCreator:
             "created_users": self.created_users,
             "failed": self.failed_count,
             "licensed": self.licensed_count,
-            "new_refresh_token": self.new_refresh_token,
+            "new_refresh_token": None,
         }

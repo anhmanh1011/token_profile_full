@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 
+from admin_token_manager import AdminTokenManager
 from creator import BulkUserCreator
 from token_getter import BulkTokenGetter
 
@@ -23,8 +24,8 @@ POLL_INTERVAL = 30  # seconds to sleep when queue is full
 class TokenProducer:
     """Background producer that keeps token queue filled."""
 
-    def __init__(self, admin: dict, token_queue: queue.Queue):
-        self.admin = admin
+    def __init__(self, token_mgr: AdminTokenManager, token_queue: queue.Queue):
+        self.token_mgr = token_mgr
         self.token_queue = token_queue
         self.running = False
         self.thread: threading.Thread | None = None
@@ -81,18 +82,13 @@ class TokenProducer:
     def _produce_batch(self, count: int) -> None:
         """Create users, get tokens, push to queue."""
         # Step 1: Create users
-        creator = BulkUserCreator(self.admin, count)
+        creator = BulkUserCreator(self.token_mgr, count)
         create_result = creator.run()
         created_users = create_result["created_users"]
 
         with self.stats_lock:
             self.total_created += len(created_users)
             self.total_failed_create += create_result["failed"]
-
-        # Track refreshed admin token
-        new_rt = create_result.get("new_refresh_token")
-        if new_rt:
-            self.admin["refresh_token"] = new_rt
 
         if not created_users:
             logger.error("No users created in batch")

@@ -2,17 +2,10 @@ package token
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"math/rand"
-	"net/http"
-	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -30,26 +23,15 @@ const (
 
 // TokenInfo stores the parsed token information
 type TokenInfo struct {
-	Username     string
-	Password     string
-	RefreshToken string
-	TenantID     string
-	AccessToken  string
-	ExpiresAt    time.Time
-	dead         int32      // atomic flag: 0=alive, 1=dead (refresh token invalid)
-	exhausted    int32      // atomic flag: 0=có quota, 1=hết quota
-	failCount    int32      // atomic: số lần fail liên tiếp với status 500
-	exhaustedAt  time.Time  // thời điểm bị đánh dấu exhausted
-	mu           sync.Mutex // per-token lock for refresh
-}
-
-// RefreshTokenResponse is the response from Microsoft OAuth endpoint
-type RefreshTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-	TokenType    string `json:"token_type"`
-	Scope        string `json:"scope"`
+	Username    string
+	Password    string
+	TenantID    string
+	AccessToken string
+	ExpiresAt   time.Time
+	dead        int32     // atomic flag: 0=alive, 1=dead
+	exhausted   int32     // atomic flag: 0=có quota, 1=hết quota
+	failCount   int32     // atomic: số lần fail liên tiếp với status 500
+	exhaustedAt time.Time // thời điểm bị đánh dấu exhausted
 }
 
 // Manager handles token rotation and management
@@ -60,9 +42,6 @@ type Manager struct {
 	// Token Queue for new architecture
 	tokenQueue chan *TokenInfo
 	queueMode  bool
-
-	// HTTP client for refresh requests - with connection pooling
-	httpClient *http.Client
 
 	// Statistics
 	totalTokens    int32
@@ -75,19 +54,8 @@ type Manager struct {
 
 // NewManager creates a new token manager
 func NewManager() *Manager {
-	// Optimized HTTP client for token refresh
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-	}
-
 	return &Manager{
 		tokenInfos: make([]*TokenInfo, 0),
-		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
-		},
 	}
 }
 
@@ -149,7 +117,6 @@ func (m *Manager) LoadFromFile(filepath string) error {
 		}
 
 		credentials := parts[0]
-		refreshToken := strings.TrimSpace(parts[1])
 		tenantID := strings.TrimSpace(parts[2])
 
 		credParts := strings.SplitN(credentials, ":", 2)
@@ -158,10 +125,9 @@ func (m *Manager) LoadFromFile(filepath string) error {
 		}
 
 		tokenInfo := &TokenInfo{
-			Username:     strings.TrimSpace(credParts[0]),
-			Password:     strings.TrimSpace(credParts[1]),
-			RefreshToken: refreshToken,
-			TenantID:     tenantID,
+			Username: strings.TrimSpace(credParts[0]),
+			Password: strings.TrimSpace(credParts[1]),
+			TenantID: tenantID,
 		}
 
 		m.tokenInfos = append(m.tokenInfos, tokenInfo)
@@ -177,109 +143,6 @@ func (m *Manager) LoadFromFile(filepath string) error {
 	}
 
 	return nil
-}
-
-// refreshAccessToken calls Microsoft OAuth endpoint (per-token lock) with retry
-func (m *Manager) refreshAccessToken(info *TokenInfo) error {
-	info.mu.Lock()
-	defer info.mu.Unlock()
-
-	// Check if quota exhausted - không refresh nếu đã hết quota
-	if atomic.LoadInt32(&info.exhausted) == 1 {
-		// Kiểm tra xem đã sang ngày mới chưa (reset quota)
-		if !m.isNewDay(info.exhaustedAt) {
-			return fmt.Errorf("quota exhausted, wait until tomorrow")
-		}
-		// Reset quota cho ngày mới
-		atomic.StoreInt32(&info.exhausted, 0)
-		atomic.StoreInt32(&info.failCount, 0)
-		atomic.AddInt32(&m.exhaustedCount, -1)
-	}
-
-	// Double check - another goroutine might have refreshed
-	if info.AccessToken != "" && time.Now().Before(info.ExpiresAt) {
-		return nil
-	}
-
-	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", info.TenantID)
-
-	data := url.Values{}
-	data.Set("client_id", "5e3ce6c0-2b1f-4285-8d4b-75ee78787346")
-	data.Set("redirect_uri", "https://teams.microsoft.com/v2/auth")
-	data.Set("scope", "https://loki.delve.office.com//.default openid profile offline_access")
-	data.Set("grant_type", "refresh_token")
-	data.Set("refresh_token", info.RefreshToken)
-
-	// Retry mechanism: 3 attempts with exponential backoff
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			backoffDuration := time.Duration(1<<attempt) * time.Second
-			time.Sleep(backoffDuration)
-		}
-
-		req, err := http.NewRequest("POST", tokenURL, bytes.NewBufferString(data.Encode()))
-		if err != nil {
-			lastErr = fmt.Errorf("failed to create request: %w", err)
-			continue
-		}
-
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Origin", "https://teams.microsoft.com")
-
-		resp, err := m.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("request failed: %w", err)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response: %w", err)
-			continue
-		}
-
-		// Rate limit - retry after backoff
-		if resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("rate limited (429)")
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			lastErr = fmt.Errorf("refresh token failed with status %d", resp.StatusCode)
-			// Don't retry for auth errors (400, 401, 403) - token is truly dead
-			if resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
-				return lastErr
-			}
-			continue
-		}
-
-		var tokenResp RefreshTokenResponse
-		if err := json.Unmarshal(body, &tokenResp); err != nil {
-			lastErr = fmt.Errorf("failed to parse response: %w", err)
-			continue
-		}
-
-		info.AccessToken = tokenResp.AccessToken
-
-		// Stagger expiration: random offset 0-300 seconds (0-5 minutes)
-		// This prevents thundering herd when all tokens expire at the same time
-		randomOffset := rand.Intn(300)
-		info.ExpiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60-randomOffset) * time.Second)
-
-		if tokenResp.RefreshToken != "" {
-			info.RefreshToken = tokenResp.RefreshToken
-		}
-
-		// Reset fail count on successful refresh
-		atomic.StoreInt32(&info.failCount, 0)
-
-		return nil
-	}
-
-	return lastErr
 }
 
 // isNewDay checks if exhaustedAt is from a previous day
@@ -336,16 +199,11 @@ func (m *Manager) GetToken() (string, error) {
 			return info.AccessToken, nil
 		}
 
-		// Need to refresh (with per-token lock)
-		if err := m.refreshAccessToken(info); err != nil {
-			// Mark as dead
-			if atomic.CompareAndSwapInt32(&info.dead, 0, 1) {
-				atomic.AddInt32(&m.deadCount, 1)
-			}
-			continue
+		// Token expired — mark dead, try next
+		if atomic.CompareAndSwapInt32(&info.dead, 0, 1) {
+			atomic.AddInt32(&m.deadCount, 1)
 		}
-
-		return info.AccessToken, nil
+		continue
 	}
 
 	return "", ErrAllTokensDead
@@ -362,11 +220,17 @@ func (m *Manager) MarkQuotaExhausted(accessToken string) bool {
 			// Tăng fail count
 			newCount := atomic.AddInt32(&info.failCount, 1)
 
-			// Nếu vượt threshold, đánh dấu exhausted
+			// Nếu vượt threshold, đánh dấu exhausted và trigger delete user
 			if newCount >= QuotaExhaustedThreshold {
 				if atomic.CompareAndSwapInt32(&info.exhausted, 0, 1) {
 					info.exhaustedAt = time.Now()
 					atomic.AddInt32(&m.exhaustedCount, 1)
+					if m.deadChan != nil && info.Username != "" {
+						select {
+						case m.deadChan <- info.Username:
+						default:
+						}
+					}
 					return true
 				}
 			}
@@ -517,13 +381,8 @@ func (m *Manager) MarkDeadAndRelease(token *TokenInfo) {
 	}
 }
 
-// RefreshTokenDirect refreshes a specific token (for queue mode)
-func (m *Manager) RefreshTokenDirect(token *TokenInfo) error {
-	return m.refreshAccessToken(token)
-}
-
-// GetAccessToken returns current access token from TokenInfo
-// Refreshes if expired
+// GetAccessToken returns current access token from TokenInfo.
+// Returns error if token is dead or expired (caller should mark dead and get new one).
 func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 	if token == nil {
 		return "", ErrNoTokensAvailable
@@ -539,12 +398,8 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 		return token.AccessToken, nil
 	}
 
-	// Need refresh
-	if err := m.refreshAccessToken(token); err != nil {
-		return "", err
-	}
-
-	return token.AccessToken, nil
+	// Token expired — no refresh, caller gets new token from API
+	return "", fmt.Errorf("token expired")
 }
 
 // QueueLen returns current queue length

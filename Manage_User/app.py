@@ -14,10 +14,12 @@ import logging
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 
+from admin_token_manager import AdminTokenManager
 from cleanup import StartupCleaner
 from deleter import FastBulkDeleter
 from producer import TokenProducer
@@ -49,6 +51,7 @@ _delete_stats_lock = threading.Lock()
 
 _producer: TokenProducer | None = None
 _admin_config: dict | None = None
+_token_mgr: AdminTokenManager | None = None
 
 # ── Flask app ────────────────────────────────────────────────────────────────
 
@@ -77,28 +80,82 @@ def _load_admin_config() -> dict:
     return admins[0]
 
 
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
+
+
+def _purge_users(emails: list[str]) -> None:
+    """Permanently delete users from recycle bin by email (best-effort)."""
+    if not _token_mgr:
+        return
+    token = _token_mgr.get_token()
+    if not token:
+        return
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Find deleted user IDs by email
+    user_ids = []
+    for email in emails:
+        try:
+            resp = _token_mgr.session.get(
+                f"{GRAPH_URL}/directory/deletedItems/microsoft.graph.user"
+                f"?$filter=userPrincipalName eq '{email}'&$select=id",
+                headers=headers, timeout=10,
+            )
+            if resp.status_code == 200:
+                for u in resp.json().get("value", []):
+                    user_ids.append(u["id"])
+        except Exception:
+            pass
+
+    if not user_ids:
+        return
+
+    # Batch permanently delete
+    reqs = [
+        {"id": str(i), "method": "DELETE", "url": f"/directory/deletedItems/{uid}"}
+        for i, uid in enumerate(user_ids)
+    ]
+    try:
+        _token_mgr.session.post(
+            f"{GRAPH_URL}/$batch", headers=headers,
+            json={"requests": reqs}, timeout=60,
+        )
+    except Exception as e:
+        logger.warning("Purge batch error: %s", e)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
 @app.get("/tokens/next")
 def get_next_token():
-    """Pop the next token from the in-memory queue.
+    """Pop tokens from the in-memory queue.
+
+    Query params:
+        count: number of tokens to return (default 100, max 200)
 
     Returns:
-        200: {"email": str, "refresh_token": str, "tenant_id": str}
-        202: {"waiting": true}  — queue is currently empty
+        200: {"tokens": [{...}, ...], "count": N}
+        202: {"waiting": true, "count": 0}  — queue is currently empty
     """
-    try:
-        token = token_queue.get_nowait()
-        return jsonify(
-            {
-                "email": token["email"],
-                "refresh_token": token["refresh_token"],
-                "tenant_id": token["tenant_id"],
-            }
-        ), 200
-    except queue.Empty:
-        return jsonify({"waiting": True}), 202
+    count = min(request.args.get("count", 100, type=int), 500)
+    tokens = []
+    for _ in range(count):
+        try:
+            tok = token_queue.get_nowait()
+            tokens.append({
+                "email": tok["email"],
+                "access_token": tok["access_token"],
+                "tenant_id": tok["tenant_id"],
+            })
+        except queue.Empty:
+            break
+
+    if not tokens:
+        return jsonify({"waiting": True, "count": 0}), 202
+
+    return jsonify({"tokens": tokens, "count": len(tokens)}), 200
 
 
 @app.post("/users/delete")
@@ -113,7 +170,7 @@ def delete_users():
         400: {"error": "..."}  — malformed request
         503: {"error": "..."}  — service not initialised yet
     """
-    if _admin_config is None:
+    if _token_mgr is None:
         return jsonify({"error": "Service not initialised"}), 503
 
     body = request.get_json(silent=True)
@@ -124,12 +181,17 @@ def delete_users():
     if not emails:
         return jsonify({"deleted": 0, "failed": 0}), 200
 
-    # FastBulkDeleter with queue_suffix="" skips Redis (Task 5 contract)
-    deleter = FastBulkDeleter(_admin_config, auto_confirm=True)
+    # Soft-delete via Graph API
+    deleter = FastBulkDeleter(_token_mgr, auto_confirm=True)
     results = deleter._process_batch(emails)
 
-    deleted = sum(1 for r in results if r["success"])
+    deleted_emails = [r["email"] for r in results if r["success"]]
+    deleted = len(deleted_emails)
     failed = len(results) - deleted
+
+    # Permanently delete from recycle bin
+    if deleted_emails:
+        _purge_users(deleted_emails)
 
     with _delete_stats_lock:
         _delete_stats["total_deleted"] += deleted
@@ -183,15 +245,16 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
         3. Start TokenProducer background thread.
         4. Start Flask HTTP server.
     """
-    global _admin_config, _producer
+    global _admin_config, _producer, _token_mgr
 
     logger.info("=" * 60)
     logger.info("  Manage_User API Service starting on %s:%d", host, port)
     logger.info("=" * 60)
 
-    # Step 1: Load admin
+    # Step 1: Load admin and create shared token manager
     try:
         _admin_config = _load_admin_config()
+        _token_mgr = AdminTokenManager(_admin_config)
         logger.info(
             "Loaded admin config: domain=%s", _admin_config.get("domain", "?")
         )
@@ -202,23 +265,33 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
     # Step 2: Startup cleanup — delete orphaned bot_ users
     logger.info("Running startup cleanup...")
     try:
-        cleaner = StartupCleaner(_admin_config)
+        cleaner = StartupCleaner(_token_mgr)
         cleanup_result = cleaner.run()
         logger.info(
-            "Startup cleanup done: found=%d deleted=%d failed=%d",
+            "Startup cleanup done: found=%d deleted=%d failed=%d purged=%d",
             cleanup_result["found"],
             cleanup_result["deleted"],
             cleanup_result["failed"],
+            cleanup_result.get("purged", 0),
         )
     except Exception as e:
         logger.warning("Startup cleanup encountered an error: %s", e)
 
-    # Step 3: Start token producer
+    # Step 3: Start token producer and wait for queue to fill
     logger.info("Starting TokenProducer background thread...")
-    _producer = TokenProducer(_admin_config, token_queue)
+    _producer = TokenProducer(_token_mgr, token_queue)
     _producer.start()
 
-    # Step 4: Run Flask (blocking)
+    # Step 4: Wait until queue has >= MIN_QUEUE_SIZE tokens
+    from producer import MIN_QUEUE_SIZE
+    logger.info("Waiting for queue to fill to %d tokens...", MIN_QUEUE_SIZE)
+    while token_queue.qsize() < MIN_QUEUE_SIZE:
+        size = token_queue.qsize()
+        logger.info("Queue: %d / %d tokens, waiting...", size, MIN_QUEUE_SIZE)
+        time.sleep(5)
+    logger.info("Queue ready: %d tokens", token_queue.qsize())
+
+    # Step 5: Run Flask (blocking)
     logger.info("Flask ready — listening on %s:%d", host, port)
     app.run(host=host, port=port, threaded=True)
 

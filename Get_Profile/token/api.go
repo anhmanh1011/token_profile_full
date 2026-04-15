@@ -26,11 +26,17 @@ type APIClient struct {
 	deleteChan chan string
 }
 
-// fetchTokenResponse is the JSON payload returned by GET /tokens/next.
+// fetchTokenResponse is a single token in the batch response.
 type fetchTokenResponse struct {
-	Email        string `json:"email"`
-	RefreshToken string `json:"refresh_token"`
-	TenantID     string `json:"tenant_id"`
+	Email       string `json:"email"`
+	AccessToken string `json:"access_token"`
+	TenantID    string `json:"tenant_id"`
+}
+
+// fetchBatchResponse is the JSON payload returned by GET /tokens/next?count=N.
+type fetchBatchResponse struct {
+	Tokens []fetchTokenResponse `json:"tokens"`
+	Count  int                  `json:"count"`
 }
 
 // deleteRequest is the JSON payload sent to POST /users/delete.
@@ -50,13 +56,11 @@ func NewAPIClient(baseURL string) *APIClient {
 	}
 }
 
-// FetchToken calls GET {baseURL}/tokens/next.
-//   - 200: returns a populated *TokenInfo.
-//   - 202: returns (nil, nil) — queue is empty; caller should retry.
-//   - Connection error: retried up to 3 times with a 5-second pause between attempts.
-//   - Any other status: returns a non-nil error immediately.
-func (c *APIClient) FetchToken() (*TokenInfo, error) {
-	url := c.baseURL + "/tokens/next"
+// FetchTokens calls GET {baseURL}/tokens/next?count=N and returns up to N tokens.
+// Returns nil (empty slice) when the queue is empty (202); caller should retry.
+// Connection errors are retried up to 3 times with a 5-second pause.
+func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
+	url := fmt.Sprintf("%s/tokens/next?count=%d", c.baseURL, count)
 
 	var lastErr error
 
@@ -65,7 +69,7 @@ func (c *APIClient) FetchToken() (*TokenInfo, error) {
 			time.Sleep(5 * time.Second)
 		}
 
-		resp, err := c.httpClient.Get(url) //nolint:noctx // no caller context available at this call site
+		resp, err := c.httpClient.Get(url) //nolint:noctx
 		if err != nil {
 			lastErr = fmt.Errorf("token/api: fetch attempt %d: %w", attempt+1, err)
 			slog.Warn("token/api: fetch connection error, retrying",
@@ -85,22 +89,26 @@ func (c *APIClient) FetchToken() (*TokenInfo, error) {
 
 		switch resp.StatusCode {
 		case http.StatusOK:
-			var payload fetchTokenResponse
-			if err := json.Unmarshal(body, &payload); err != nil {
-				return nil, fmt.Errorf("token/api: parse fetch response: %w", err)
+			var batch fetchBatchResponse
+			if err := json.Unmarshal(body, &batch); err != nil {
+				return nil, fmt.Errorf("token/api: parse batch response: %w", err)
 			}
-			return &TokenInfo{
-				Username:     payload.Email,
-				RefreshToken: payload.RefreshToken,
-				TenantID:     payload.TenantID,
-			}, nil
+			tokens := make([]*TokenInfo, 0, len(batch.Tokens))
+			for _, t := range batch.Tokens {
+				tokens = append(tokens, &TokenInfo{
+					Username:    t.Email,
+					AccessToken: t.AccessToken,
+					TenantID:    t.TenantID,
+					ExpiresAt:   time.Now().Add(50 * time.Minute),
+				})
+			}
+			return tokens, nil
 
 		case http.StatusAccepted:
-			// 202 means the queue is temporarily empty; caller retries.
-			return nil, nil
+			return nil, nil // Queue empty
 
 		default:
-			return nil, fmt.Errorf("token/api: unexpected status %d fetching token", resp.StatusCode)
+			return nil, fmt.Errorf("token/api: unexpected status %d", resp.StatusCode)
 		}
 	}
 

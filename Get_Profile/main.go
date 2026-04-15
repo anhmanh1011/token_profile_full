@@ -95,23 +95,24 @@ func main() {
 	tokenManager.InitEmptyQueue(2000)
 	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
 
-	// Pre-fetch initial batch of tokens
-	const prefetchCount = 50
-	fetched := 0
-	for fetched < prefetchCount {
-		t, err := apiClient.FetchToken()
+	// Pre-fetch initial batch of tokens (1 API call for 500 tokens)
+	log.Println("[TOKEN] Fetching initial tokens from API...")
+	var fetched int
+	for fetched == 0 {
+		tokens, err := apiClient.FetchTokens(500)
 		if err != nil {
-			log.Printf("[TOKEN] Pre-fetch error after %d tokens: %v", fetched, err)
+			log.Printf("[TOKEN] Pre-fetch error: %v", err)
 			break
 		}
-		if t == nil {
-			// 202: queue temporarily empty, wait and retry
-			log.Printf("[TOKEN] Pre-fetch: API queue empty, waiting 2s... (%d/%d fetched)", fetched, prefetchCount)
+		if tokens == nil {
+			log.Println("[TOKEN] Pre-fetch: API queue empty, waiting 2s...")
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		tokenManager.AddToken(t)
-		fetched++
+		for _, t := range tokens {
+			tokenManager.AddToken(t)
+		}
+		fetched = len(tokens)
 	}
 	if fetched == 0 {
 		log.Fatalf("[ERROR] Failed to pre-fetch any tokens from API")
@@ -136,7 +137,7 @@ func main() {
 	apiClient.StartDeleteWorker(deleteCtx, &deleteWg)
 	log.Println("[API] Delete worker started")
 
-	// Background token fetcher goroutine
+	// Background token fetcher goroutine (batch 500 per API call)
 	fetchCtx, fetchCancel := context.WithCancel(context.Background())
 	go func() {
 		for {
@@ -146,19 +147,21 @@ func main() {
 			default:
 			}
 
-			if tokenManager.QueueLen() < 50 {
-				t, err := apiClient.FetchToken()
+			if tokenManager.QueueLen() < 100 {
+				tokens, err := apiClient.FetchTokens(500)
 				if err != nil {
 					log.Printf("[TOKEN] Background fetch error: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
-				if t == nil {
-					// 202: queue empty, wait before retry
+				if tokens == nil {
 					time.Sleep(2 * time.Second)
 					continue
 				}
-				tokenManager.AddToken(t)
+				for _, t := range tokens {
+					tokenManager.AddToken(t)
+				}
+				log.Printf("[TOKEN] Background fetched %d tokens, queue: %d", len(tokens), tokenManager.QueueLen())
 			} else {
 				time.Sleep(1 * time.Second)
 			}

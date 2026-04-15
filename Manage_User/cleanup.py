@@ -10,12 +10,12 @@ import time
 from typing import Optional
 
 import requests
-from requests.adapters import HTTPAdapter
+
+from admin_token_manager import AdminTokenManager
 
 logger = logging.getLogger(__name__)
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
-CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
 BATCH_SIZE = 20
 BOT_PREFIX = "bot_"
 
@@ -27,56 +27,18 @@ class StartupCleaner:
     Designed for startup crash recovery — no Redis dependency.
     """
 
-    def __init__(self, admin: dict) -> None:
-        self.tenant_id = admin["tenant_id"]
-        self.refresh_token = admin["refresh_token"]
-        self.domain = admin["domain"]
-
-        self.access_token: Optional[str] = None
-        self.token_expires: float = 0
+    def __init__(self, token_mgr: AdminTokenManager) -> None:
+        self.token_mgr = token_mgr
+        self.domain = token_mgr.domain
 
         # Stats
         self.found = 0
         self.deleted = 0
         self.failed = 0
 
-        # Session with connection pooling
-        self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3)
-        self.session.mount("https://", adapter)
-
     def _get_token(self) -> Optional[str]:
-        """Refresh Microsoft OAuth access token."""
-        if self.access_token and time.time() < self.token_expires:
-            return self.access_token
-
-        token_url = (
-            f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
-        )
-        data = {
-            "client_id": CLIENT_ID,
-            "scope": "https://graph.microsoft.com/.default offline_access",
-            "refresh_token": self.refresh_token,
-            "grant_type": "refresh_token",
-        }
-
-        try:
-            resp = self.session.post(token_url, data=data, timeout=30)
-            if resp.status_code == 200:
-                token_data = resp.json()
-                self.access_token = token_data["access_token"]
-                if "refresh_token" in token_data:
-                    self.refresh_token = token_data["refresh_token"]
-                self.token_expires = (
-                    time.time() + token_data.get("expires_in", 3600) - 300
-                )
-                return self.access_token
-            else:
-                logger.error("Token error: %s", resp.text[:200])
-        except requests.RequestException as e:
-            logger.error("Token request failed: %s", e)
-
-        return None
+        """Delegate token retrieval to the shared AdminTokenManager."""
+        return self.token_mgr.get_token()
 
     def _list_bot_users(self) -> list[str]:
         """List all bot_ prefix users via Graph API with pagination.
@@ -100,7 +62,7 @@ class StartupCleaner:
 
         while url:
             try:
-                resp = self.session.get(url, headers=headers, timeout=30)
+                resp = self.token_mgr.session.get(url, headers=headers, timeout=30)
 
                 if resp.status_code == 429:
                     retry_after = int(resp.headers.get("Retry-After", 5))
@@ -175,7 +137,7 @@ class StartupCleaner:
         retry_emails: list[str] = []
 
         try:
-            resp = self.session.post(
+            resp = self.token_mgr.session.post(
                 f"{GRAPH_URL}/$batch",
                 headers=headers,
                 json={"requests": requests_list},
@@ -296,11 +258,116 @@ class StartupCleaner:
 
         elapsed = time.time() - start_time
         logger.info(
-            "Cleanup complete: %d found, %d deleted, %d failed in %.1fs",
+            "Soft-delete complete: %d found, %d deleted, %d failed in %.1fs",
             self.found,
             self.deleted,
             self.failed,
             elapsed,
         )
 
-        return {"found": self.found, "deleted": self.deleted, "failed": self.failed}
+        # Permanently delete from recycle bin
+        purged = self._purge_deleted_bot_users()
+        logger.info("Permanently purged %d users from recycle bin", purged)
+
+        return {"found": self.found, "deleted": self.deleted, "failed": self.failed, "purged": purged}
+
+    def _list_deleted_bot_users(self) -> list[dict]:
+        """List bot_ users in the recycle bin (deletedItems).
+
+        Returns:
+            List of {"id": str, "upn": str} for permanently deleting.
+        """
+        token = self._get_token()
+        if not token:
+            return []
+
+        headers = {"Authorization": f"Bearer {token}"}
+        url = (
+            f"{GRAPH_URL}/directory/deletedItems/microsoft.graph.user"
+            f"?$select=id,userPrincipalName&$top=999"
+        )
+        deleted_users: list[dict] = []
+
+        while url:
+            try:
+                resp = self.token_mgr.session.get(url, headers=headers, timeout=30)
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 5))
+                    time.sleep(min(retry_after, 30))
+                    token = self._get_token() or token
+                    headers = {"Authorization": f"Bearer {token}"}
+                    continue
+                if resp.status_code != 200:
+                    logger.error("List deleted users failed: %d", resp.status_code)
+                    break
+
+                page = resp.json()
+                for user in page.get("value", []):
+                    upn = user.get("userPrincipalName", "")
+                    if upn.startswith(BOT_PREFIX):
+                        deleted_users.append({"id": user["id"], "upn": upn})
+
+                url = page.get("@odata.nextLink")
+            except requests.RequestException as e:
+                logger.error("Error listing deleted users: %s", e)
+                break
+
+        return deleted_users
+
+    def _purge_deleted_bot_users(self) -> int:
+        """Permanently delete all bot_ users from recycle bin via batch API.
+
+        Returns:
+            Number of users permanently purged.
+        """
+        deleted_users = self._list_deleted_bot_users()
+        if not deleted_users:
+            logger.info("No bot_ users in recycle bin to purge")
+            return 0
+
+        logger.info("Found %d bot_ users in recycle bin, purging...", len(deleted_users))
+
+        purged = 0
+        batches = [
+            deleted_users[i : i + BATCH_SIZE]
+            for i in range(0, len(deleted_users), BATCH_SIZE)
+        ]
+
+        for batch in batches:
+            token = self._get_token()
+            if not token:
+                break
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            requests_list = [
+                {"id": str(i), "method": "DELETE", "url": f"/directory/deletedItems/{u['id']}"}
+                for i, u in enumerate(batch)
+            ]
+
+            try:
+                resp = self.token_mgr.session.post(
+                    f"{GRAPH_URL}/$batch",
+                    headers=headers,
+                    json={"requests": requests_list},
+                    timeout=60,
+                )
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 5))
+                    time.sleep(min(retry_after, 30))
+                    continue
+                if resp.status_code == 200:
+                    for r in resp.json().get("responses", []):
+                        if r["status"] == 204:
+                            purged += 1
+                        else:
+                            logger.debug("Purge failed [%d]: %s", r["status"],
+                                         r.get("body", {}).get("error", {}).get("code", ""))
+            except requests.RequestException as e:
+                logger.error("Purge batch error: %s", e)
+
+            time.sleep(1)
+
+        return purged
