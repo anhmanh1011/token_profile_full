@@ -46,6 +46,22 @@ cargo build --release
 # Binary: target/release/email-gen  (Linux/macOS) hoặc email-gen.exe (Windows)
 ```
 
+## Linux one-shot launcher
+
+`run.sh` tự cài rustup nếu thiếu, build release, rồi chạy với input/output defaults. Forward thêm flags cho binary:
+
+```bash
+cd email-gen
+chmod +x run.sh
+./run.sh                             # defaults: testdata/{domains,usernames}.txt → ../Get_Profile/emails.txt
+
+# Override qua env:
+DOMAINS=/path/to/d.txt USERNAMES=/path/to/u.txt OUTPUT=/tmp/emails.txt ./run.sh
+
+# Forward flags:
+./run.sh --gzip --split 1 --format csv
+```
+
 ## Sử dụng
 
 ```bash
