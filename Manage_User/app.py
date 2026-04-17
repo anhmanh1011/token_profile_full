@@ -182,7 +182,7 @@ def delete_users():
         return jsonify({"deleted": 0, "failed": 0}), 200
 
     # Soft-delete via Graph API
-    deleter = FastBulkDeleter(_token_mgr, auto_confirm=True)
+    deleter = FastBulkDeleter(_token_mgr)
     results = deleter._process_batch(emails)
 
     deleted_emails = [r["email"] for r in results if r["success"]]

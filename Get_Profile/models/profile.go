@@ -30,16 +30,3 @@ type Result struct {
 	Location        string
 	LinkedInURL     string
 }
-
-// Job represents a work item for workers
-type Job struct {
-	Email string
-}
-
-// JobResult represents the result of processing a job
-type JobResult struct {
-	Email   string
-	Success bool
-	Result  *Result
-	Error   error
-}

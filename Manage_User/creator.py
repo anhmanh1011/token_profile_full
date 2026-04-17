@@ -1,10 +1,9 @@
 """
 Bulk User Creator — Create Microsoft 365 users via Graph Batch API.
 
-Refactored from create_user.py:
-- Returns created_users list instead of writing to file
-- Delegates token management to shared AdminTokenManager
-- Cross-platform compatible
+Generates `bot_*@<domain>` users, creates them through the `/$batch` endpoint
+in chunks of 20 with 2 worker threads, optionally assigns an available license,
+and returns `{created_users, failed, licensed}`.
 """
 import logging
 import queue

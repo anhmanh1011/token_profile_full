@@ -1,13 +1,13 @@
 """
-Bulk Token Getter — Get refresh tokens for users via browser flow.
+Bulk Token Getter — Obtain Loki access tokens via Microsoft Teams browser flow.
 
-Refactored from get_refresh_token_user.py:
-- Accepts user list from orchestrator (no account.txt)
-- Returns results dict instead of writing to files
-- Cross-platform (no ctypes.windll, no os.system("clear"))
-- No globals — all state in BulkTokenGetter class
-- Reduced default threads for stability
-- Keeps: TeamOutLook browser flow, curl_cffi, change password logic
+`TeamOutLook` drives the full Teams MSAL flow with curl_cffi Firefox impersonation
+(authorize → login → optional forced password change → KMSI → code exchange →
+rescope to Loki). `BulkTokenGetter` runs a pool of 30 worker threads over a
+user list and returns `{tokens, failed}`.
+
+Note: the name is historical — this returns access_tokens (Loki-scoped, ~50min
+TTL), not refresh_tokens. Go uses them directly without refresh logic.
 """
 import json
 import logging

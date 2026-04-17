@@ -186,23 +186,11 @@ func (p *Pool) safeRequeue(email string) {
 	}
 }
 
-// worker is the worker goroutine - optimized for throughput
-// Queue mode: each worker holds one token and processes multiple emails
+// worker is the worker goroutine — each worker holds one token from the queue
+// and processes emails with it until the token dies.
 func (p *Pool) worker() {
 	defer p.wg.Done()
 
-	if p.tokenManager.IsQueueMode() {
-		p.workerWithTokenQueue()
-	} else {
-		// Legacy mode: round-robin tokens
-		for email := range p.jobsChan {
-			p.processEmail(email)
-		}
-	}
-}
-
-// workerWithTokenQueue - worker that holds a token from queue
-func (p *Pool) workerWithTokenQueue() {
 	for {
 		// 1. Acquire token from queue (blocks until available or closed)
 		token := p.tokenManager.AcquireToken()
@@ -328,109 +316,6 @@ func (p *Pool) workerWithTokenQueue() {
 			}
 			return // jobsChan closed normally
 		}
-	}
-}
-
-// processEmail processes an email (retry on 401/424/403 with new token)
-func (p *Pool) processEmail(email string) {
-	atomic.AddUint64(&p.processed, 1)
-
-	maxRetries := 3
-	retryCount := 0
-
-	for {
-		// Fast check for alive tokens
-		if !p.tokenManager.HasAliveTokens() {
-			p.trackFailReason("no_alive_tokens")
-			atomic.AddUint64(&p.failed, 1)
-			return
-		}
-
-		// Get token
-		tkn, err := p.tokenManager.GetToken()
-		if err != nil {
-			p.trackFailReason("get_token_error")
-			atomic.AddUint64(&p.failed, 1)
-			return
-		}
-
-		// Wait for rate limit
-		if err := p.waitForRateLimit(); err != nil {
-			// Context cancelled
-			return
-		}
-
-		// Make API call
-		result, statusCode, err := p.apiClient.FetchProfile(email, tkn)
-
-		// Handle 401/424 - token exhausted, mark dead and retry
-		if statusCode == 401 || statusCode == 424 {
-			p.tokenManager.MarkDead(tkn)
-			total, alive, dead := p.tokenManager.Stats()
-			log.Printf("[TOKEN] Token dead (status %d)! Total: %d, Alive: %d, Dead: %d", statusCode, total, alive, dead)
-			continue // Always retry with new token, no limit
-		}
-
-		// Handle 403 - might be rate limit, retry with different token
-		if statusCode == 403 {
-			retryCount++
-			if retryCount > maxRetries {
-				p.trackFailReason("status_403")
-				atomic.AddUint64(&p.failed, 1)
-				return
-			}
-			time.Sleep(500 * time.Millisecond) // Backoff khi bị rate limit
-			continue
-		}
-
-		// Handle 5xx server errors - retry
-		if statusCode >= 500 {
-			// Track quota exhaustion cho status 500
-			if statusCode == 500 {
-				exhausted := p.tokenManager.MarkQuotaExhausted(tkn)
-				if exhausted {
-					total, alive, dead, exhaustedCount := p.tokenManager.FullStats()
-					log.Printf("[TOKEN] Token quota exhausted! Total: %d, Alive: %d, Dead: %d, Exhausted: %d", total, alive, dead, exhaustedCount)
-				}
-			}
-			retryCount++
-			if retryCount > maxRetries {
-				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
-				atomic.AddUint64(&p.failed, 1)
-				return
-			}
-			time.Sleep(200 * time.Millisecond) // Backoff khi server error
-			continue
-		}
-
-		// Success
-		if err == nil {
-			// Reset fail count on successful API response
-			p.tokenManager.ResetFailCount(tkn)
-
-			atomic.AddUint64(&p.successful, 1)
-
-			if result != nil {
-				atomic.AddUint64(&p.exactMatch, 1)
-				if writeErr := p.resultWriter.WriteResult(result); writeErr != nil {
-					log.Printf("[WRITER] Failed to write result: %v", writeErr)
-				}
-			}
-			return
-		}
-
-		// Other errors (4xx except 401/403/424, or connection errors)
-		if statusCode > 0 {
-			p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
-		} else {
-			p.trackFailReason("connection_error")
-		}
-
-		failCount := atomic.AddUint64(&p.failed, 1)
-		if failCount <= 10 {
-			log.Printf("[ERROR] API call failed for %s (status: %d): %v", email, statusCode, err)
-		}
-		return
 	}
 }
 
