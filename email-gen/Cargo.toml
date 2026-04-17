@@ -1,0 +1,35 @@
+[package]
+name = "email-gen"
+version = "0.1.0"
+edition = "2021"
+authors = ["token_profile_full"]
+description = "Cross-product email generator (domains x usernames)"
+license = "MIT"
+
+[dependencies]
+rayon = "1.10"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"
+flate2 = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+rand = "0.8"
+num_cpus = "1.16"
+memchr = "2.7"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.10"
+
+[[bench]]
+name = "generator_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -18,15 +18,24 @@ cd Manage_User && python -m py_compile app.py && python -m py_compile cleanup.py
 
 # Build & vet Go modules
 cd Get_Profile && go build . && go vet ./...
+
+# email-gen: build, test, bench (Rust)
+cd email-gen && cargo build --release
+cd email-gen && cargo test --release
+cd email-gen && cargo clippy --release -- -D warnings
+cd email-gen && cargo bench
 ```
 
 Note: On the developer's Windows machine, use `py` instead of `python`.
 
 ## Architecture
 
-Two independent apps on the same VPS. **Manage_User** (Python) runs as a long-running HTTP API service that creates users and serves access tokens. **Get_Profile** (Go) is a batch job that fetches tokens from the API and uses them to get LinkedIn profiles.
+Three independent apps on the same VPS:
+- **Manage_User** (Python) — long-running HTTP API service tạo users và phát access tokens.
+- **Get_Profile** (Go) — batch job fetch LinkedIn profiles, consume tokens qua HTTP.
+- **email-gen** (Rust) — CLI utility standalone sinh `emails.txt` (input cho Get_Profile) bằng cross-product domains × usernames.
 
-**No Redis required.** Communication is via HTTP on localhost.
+**No Redis required.** Manage_User ↔ Get_Profile giao tiếp qua HTTP localhost. email-gen độc lập, user chạy tay sinh file.
 
 ```
 admin_token.json
@@ -55,10 +64,10 @@ admin_token.json
 | `creator.py` | `BulkUserCreator` | `AdminTokenManager`, count | `{created_users: [{email, password}], failed, licensed}` |
 | `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, access_token, tenant_id}], failed}` |
 | `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥500 tokens in queue |
-| `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` (queue_suffix optional) | `{deleted, failed, skipped_admins}` |
+| `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` | `_process_batch(emails)` → `[{email, success, [error]}]` per email |
 | `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point) |
 
-`app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth. `main.py` and `redis_pusher.py` are the legacy Redis-based pipeline (kept for reference).
+`app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth.
 
 ### Get_Profile module structure
 
@@ -73,6 +82,22 @@ admin_token.json
 
 `main.go` wires everything — it is the only entry point. Required: `--api` flag (default `http://localhost:5000`).
 
+### email-gen module structure
+
+| File | Trách nhiệm |
+|------|-------------|
+| `src/main.rs` | Entry point, wiring |
+| `src/lib.rs` | Module re-exports |
+| `src/config.rs` | Cli (clap derive) + Config validation + OutputFormat |
+| `src/reader.rs` | Mmap + memchr line scan + dedup domains + load_usernames |
+| `src/generator.rs` | Rayon cross-product + ByteBudget backpressure |
+| `src/writer.rs` | Writer thread (crossbeam channel consumer) |
+| `src/splitter.rs` | File rotation + gzip wrapping (SingleFile, Splitter) |
+| `src/stats.rs` | Stats + print_vi + ram_peak (Linux /proc, Windows psapi) |
+| `src/error.rs` | thiserror enums: Config/Reader/Gen/WriterError |
+
+Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để giữ RAM < 500 MB với 200 usernames. User override bằng `-c`.
+
 ### Key design decisions
 
 - **Browser flow for tokens**: `token_getter.py` uses `curl_cffi` to impersonate a browser for Microsoft Teams OAuth. Do not replace with ROPC or Graph API.
@@ -86,11 +111,7 @@ admin_token.json
 - **Concurrency model (Go)**: 550 worker goroutines, rate limiter 20K CPM, token queue mode.
 - **Token producer auto-refill**: Background thread keeps ≥500 tokens in `queue.Queue(maxsize=1000)`. Creates batch of 100 users at a time. Flask waits for queue to fill before accepting requests.
 - **Batch token API**: `GET /tokens/next?count=500` returns up to 500 tokens per call. Go pre-fetches 500 tokens at startup, background goroutine refills 500 when pool < 100.
-- **Batch user deletion**: Go goms dead+exhausted token emails into batches of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge.
-
-### Legacy files
-
-`delete_fast.py`, `create_user.py`, `get_refresh_token_user.py`, `main.py`, `redis_pusher.py` are legacy files kept for reference only.
+- **Batch user deletion**: Go batches dead+exhausted token emails into groups of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge.
 
 ## Environments
 

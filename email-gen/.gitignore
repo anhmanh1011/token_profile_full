@@ -1,0 +1,6 @@
+target/
+testdata/*.txt
+!testdata/.gitkeep
+*.gz
+emails.txt
+emails_*.txt

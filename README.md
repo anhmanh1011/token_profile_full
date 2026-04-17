@@ -20,6 +20,20 @@ High-performance LinkedIn profile fetcher:
 - Dead/exhausted token → batch delete users (`POST /users/delete`)
 - Output: `result_TIMESTAMP.txt`
 
+### [email-gen](email-gen/) (Rust) — CLI Utility
+
+Standalone CLI sinh `emails.txt` cho Get_Profile bằng cross-product `domains.txt × usernames.txt`:
+- Input: 1M domains + 200 usernames → 200M emails (~10 GB)
+- Target: < 60 s trên 8 core NVMe, RAM < 500 MB
+- Parallel (rayon) + mmap (memmap2) + dedicated writer thread (crossbeam channel)
+- Hỗ trợ split, gzip, csv/json format, dedup domains, shuffle chunks
+
+Chạy tay trước khi start Get_Profile:
+```bash
+cd email-gen && cargo build --release
+./target/release/email-gen -d domains.txt -u usernames.txt -o ../Get_Profile/emails.txt
+```
+
 ## Kiến trúc tổng quan
 
 ```
@@ -51,6 +65,7 @@ admin_token.json (input)
 
 - Python 3.10+ (Manage_User)
 - Go 1.21+ (Get_Profile)
+- Rust 1.74+ / Cargo (email-gen) — [rustup.rs](https://rustup.rs) nếu chưa cài
 - **Không cần Redis** — giao tiếp qua HTTP localhost
 
 ## Quick Start
