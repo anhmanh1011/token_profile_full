@@ -8,14 +8,14 @@ Hệ thống tự động quản lý user Microsoft 365 và thu thập LinkedIn 
 
 Long-running HTTP service quản lý lifecycle users:
 - **Startup cleanup**: Xóa toàn bộ `bot_` users từ lần chạy trước
-- **Background producer**: Tự động tạo users + lấy access tokens, giữ ≥500 tokens trong queue
+- **Background producer**: Tự động tạo users + lấy refresh tokens, giữ ≥100 tokens trong queue
 - **API endpoints**: Serve tokens cho Go app, nhận yêu cầu xóa users
 
 ### [Get_Profile](Get_Profile/) (Go) — Batch Job
 
 High-performance LinkedIn profile fetcher:
-- Lấy access tokens từ Python API (`GET /tokens/next?count=500`)
-- 550 worker goroutines, rate limit 20K CPM
+- Lấy refresh tokens từ Python API (`GET /tokens/next?count=500`), lazy-exchange sang Loki access_token khi worker cần dùng
+- 400 worker goroutines, rate limit 20K CPM
 - Call Loki API (Delve Office) lấy LinkedIn profile
 - Dead/exhausted token → batch delete users (`POST /users/delete`)
 - Output: `result_TIMESTAMP.txt`
@@ -42,7 +42,7 @@ admin_token.json (input)
        ▼
   [Manage_User API Service]  ← Python (localhost:5000)
        │
-       ├── GET  /tokens/next      (access_token)
+       ├── GET  /tokens/next      (refresh_token — Go tự exchange sang access_token)
        ├── POST /users/delete     (batch delete)
        └── GET  /status           (monitoring)
        │
@@ -90,7 +90,7 @@ go build -o get_profile.exe .
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--api` | `http://localhost:5000` | Python API service address |
-| `--workers` | `550` | Number of worker goroutines |
+| `--workers` | `400` | Number of worker goroutines |
 | `--max-cpm` | `20000` | Max requests per minute |
 | `--emails` | `emails.txt` | Path to emails file |
 | `--result` | `result_TIMESTAMP.txt` | Path to result file |

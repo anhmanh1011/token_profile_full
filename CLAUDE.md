@@ -44,13 +44,13 @@ admin_token.json
   [Manage_User API Service]  (Python, localhost:5000)
   StartupCleaner → TokenProducer (background thread)
        │
-       ├── GET  /tokens/next    → access_token
+       ├── GET  /tokens/next    → refresh_token (Go tự exchange sang access_token)
        ├── POST /users/delete   → batch delete users
        └── GET  /status         → monitoring
        │
        ▼
   [Get_Profile]  (Go, batch job)
-  APIClient → TokenManager → WorkerPool(550) → Loki API → result.txt
+  APIClient → TokenManager → WorkerPool(400) → Loki API → result.txt
        │
        └── POST /users/delete (batch 20, dead token cleanup)
 ```
@@ -62,8 +62,8 @@ admin_token.json
 | `admin_token_manager.py` | `AdminTokenManager` | admin dict | Shared OAuth token manager (thread-safe, auto-refresh, rotation tracking) |
 | `cleanup.py` | `StartupCleaner` | `AdminTokenManager` | `{found, deleted, failed, purged}` — soft-delete + permanently purge `bot_` users |
 | `creator.py` | `BulkUserCreator` | `AdminTokenManager`, count | `{created_users: [{email, password}], failed, licensed}` |
-| `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, access_token, tenant_id}], failed}` |
-| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥500 tokens in queue |
+| `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, refresh_token, tenant_id}], failed}` |
+| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥100 tokens in queue |
 | `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` | `_process_batch(emails)` → `[{email, success, [error]}]` per email |
 | `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point) |
 
@@ -74,7 +74,8 @@ admin_token.json
 | Package | File | Responsibility |
 |---------|------|----------------|
 | `token` | `api.go` | HTTP client for Python API (`/tokens/next`, `/users/delete`) |
-| `token` | `manager.go` | Token queue, dead notification, access token validation |
+| `token` | `exchange.go` | `ExchangeRefreshToken` — swap refresh_token → Loki access_token (2 retries on transient) |
+| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo |
 | `api` | `client.go` | Loki API client, connection pooling, gzip |
 | `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode |
 | `reader` | `file.go` | Streaming email reader from file |
@@ -104,13 +105,13 @@ Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để g
 - **1 VPS = 1 admin**: First admin from `admin_token.json` is used.
 - **User prefix `bot_`**: All app-created users have `bot_` prefix in userPrincipalName. Startup cleanup lists and deletes all `bot_` users for crash recovery.
 - **Shared AdminTokenManager**: Single `AdminTokenManager` instance handles admin OAuth for all modules. Thread-safe, auto-refresh, tracks refresh_token rotation, saves to `admin_token.json`.
-- **Access tokens (not refresh tokens)**: Python gets loki-scoped access_token from browser flow. Go uses it directly (~50 min TTL). No refresh logic in Go — expired/dead/exhausted tokens trigger user deletion and new token fetch.
+- **Refresh tokens in queue, Go exchanges lazily**: Python browser flow returns the raw refresh_token (~24h TTL) — no Loki rescope on the Python side. Queue contains refresh_token + tenant_id; Go's `token.Manager.GetAccessToken` lazily exchanges to a Loki access_token (~1h TTL) on first use and re-exchanges when the cached access_token nears expiry, so one refresh_token yields many access_tokens over its 24h window. Exchange failures retry 2× with 1s backoff; permanent failures (invalid_grant) or 401/424/500-exhausted responses still trigger user deletion as before.
 - **Permanently delete users**: All user deletions (cleanup + runtime) are permanent — soft-delete via Graph API followed by `DELETE /directory/deletedItems/{id}` to purge from recycle bin. Prevents Directory_QuotaExceeded.
 - **Graph Batch API**: Both deleter and creator use `/$batch` endpoint with `BATCH_SIZE=20` (Graph API max per batch).
 - **Threading model (Python)**: creator (2 workers), token_getter (30 workers), producer (1 background thread).
-- **Concurrency model (Go)**: 550 worker goroutines, rate limiter 20K CPM, token queue mode.
-- **Token producer auto-refill**: Background thread keeps ≥500 tokens in `queue.Queue(maxsize=1000)`. Creates batch of 100 users at a time. Flask waits for queue to fill before accepting requests.
-- **Batch token API**: `GET /tokens/next?count=500` returns up to 500 tokens per call. Go pre-fetches 500 tokens at startup, background goroutine refills 500 when pool < 100.
+- **Concurrency model (Go)**: 400 worker goroutines, rate limiter 20K CPM, token queue mode.
+- **Token producer auto-refill**: Background thread keeps ≥100 tokens in `queue.Queue(maxsize=1000)`. Creates batch of 100 users at a time. Flask waits for queue to fill before accepting requests.
+- **Batch token API**: `GET /tokens/next?count=300` returns up to 300 tokens per call (cap server-side is 500). Go pre-fetches 300 tokens at startup, background goroutine refills 300 when pool < 100.
 - **Batch user deletion**: Go batches dead+exhausted token emails into groups of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge.
 
 ## Environments

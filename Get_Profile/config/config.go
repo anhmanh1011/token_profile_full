@@ -30,7 +30,7 @@ func NewConfig() *Config {
 
 		APIAddr: "http://localhost:5000",
 
-		NumWorkers: 550,
+		NumWorkers: 400,
 
 		APITimeout: 30,
 

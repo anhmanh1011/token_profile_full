@@ -199,16 +199,9 @@ func (p *Pool) worker() {
 			return
 		}
 
-		// 2. Refresh token before use
-		accessToken, err := p.tokenManager.GetAccessToken(token)
-		if err != nil {
-			// Token dead on refresh, get another
-			p.tokenManager.MarkDeadAndRelease(token)
-			log.Printf("[TOKEN] Token refresh failed, getting new token...")
-			continue
-		}
-
-		// 3. Process emails with this token until it dies
+		// 2. Process emails with this token until it dies.
+		//    GetAccessToken lazily exchanges refresh_token → access_token and
+		//    re-exchanges when the cached access_token nears expiry.
 		tokenDead := false
 		for email := range p.jobsChan {
 			if tokenDead {
@@ -219,17 +212,13 @@ func (p *Pool) worker() {
 
 			atomic.AddUint64(&p.processed, 1)
 
-			// Check if access token expired, refresh
-			if token.ExpiresAt.Before(time.Now().Add(30 * time.Second)) {
-				newAccessToken, err := p.tokenManager.GetAccessToken(token)
-				if err != nil {
-					tokenDead = true
-					p.tokenManager.MarkDeadAndRelease(token)
-					// Re-queue email
-					p.safeRequeue(email)
-					break
-				}
-				accessToken = newAccessToken
+			accessToken, err := p.tokenManager.GetAccessToken(token)
+			if err != nil {
+				tokenDead = true
+				p.tokenManager.MarkDeadAndRelease(token)
+				log.Printf("[TOKEN] Exchange failed: %v — getting new token...", err)
+				p.safeRequeue(email)
+				break
 			}
 
 			// Wait for rate limit
@@ -261,26 +250,34 @@ func (p *Pool) worker() {
 				continue
 			}
 
-			// Handle 5xx - server error
+			// Handle 500 - token quota exhausted: mark exhausted + rotate token.
+			// Sau threshold fail liên tiếp, token được gửi vào deadChan để delete user.
+			if statusCode == 500 {
+				p.trackFailReason("status_500")
+				atomic.AddUint64(&p.failed, 1)
+				if p.tokenManager.MarkQuotaExhausted(token) {
+					tokenDead = true
+					_, alive, _, exhausted := p.tokenManager.FullStats()
+					log.Printf("[TOKEN] Token exhausted (consecutive 500s)! Alive: %d, Exhausted: %d", alive, exhausted)
+					p.safeRequeue(email)
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// Handle other 5xx - transient server error: backoff + retry với cùng token.
 			if statusCode >= 500 {
 				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
 				atomic.AddUint64(&p.failed, 1)
-				// Track quota exhaustion cho token này
-				if statusCode == 500 {
-					exhausted := p.tokenManager.MarkQuotaExhausted(accessToken)
-					if exhausted {
-						total, alive, dead, exhaustedCount := p.tokenManager.FullStats()
-						log.Printf("[TOKEN] Token quota exhausted! Total: %d, Alive: %d, Dead: %d, Exhausted: %d", total, alive, dead, exhaustedCount)
-					}
-				}
-				time.Sleep(200 * time.Millisecond) // Backoff khi server error
+				time.Sleep(200 * time.Millisecond)
 				continue
 			}
 
 			// Success
 			if err == nil {
 				// Reset fail count khi request thành công
-				p.tokenManager.ResetFailCount(accessToken)
+				p.tokenManager.ResetFailCount(token)
 
 				atomic.AddUint64(&p.successful, 1)
 				if result != nil {

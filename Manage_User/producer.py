@@ -16,7 +16,7 @@ from token_getter import BulkTokenGetter
 
 logger = logging.getLogger(__name__)
 
-MIN_QUEUE_SIZE = 500
+MIN_QUEUE_SIZE = 100
 BATCH_SIZE = 100
 POLL_INTERVAL = 30  # seconds to sleep when queue is full
 

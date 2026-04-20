@@ -1,13 +1,13 @@
 """
-Bulk Token Getter — Obtain Loki access tokens via Microsoft Teams browser flow.
+Bulk Token Getter — Obtain Microsoft Graph refresh tokens via Teams browser flow.
 
-`TeamOutLook` drives the full Teams MSAL flow with curl_cffi Firefox impersonation
-(authorize → login → optional forced password change → KMSI → code exchange →
-rescope to Loki). `BulkTokenGetter` runs a pool of 30 worker threads over a
-user list and returns `{tokens, failed}`.
+`TeamOutLook` drives the Teams MSAL flow with curl_cffi Firefox impersonation
+(authorize → login → optional forced password change → KMSI → code exchange)
+and stores the resulting refresh_token + tenant_id. `BulkTokenGetter` runs a
+pool of 30 worker threads over a user list and returns `{tokens, failed}`.
 
-Note: the name is historical — this returns access_tokens (Loki-scoped, ~50min
-TTL), not refresh_tokens. Go uses them directly without refresh logic.
+Go side exchanges refresh_token → Loki-scoped access_token lazily per worker
+to take advantage of the ~24h refresh_token TTL (vs ~1h access_token TTL).
 """
 import json
 import logging
@@ -55,7 +55,6 @@ class TeamOutLook:
 
         # Results
         self.refresh_token: Optional[str] = None
-        self.access_token: Optional[str] = None
         self.final_password: Optional[str] = None
 
     def clear_cookies(self) -> None:
@@ -380,7 +379,7 @@ class TeamOutLook:
 
         return code
 
-    def get_access_token(self, code: str) -> bool:
+    def get_refresh_token(self, code: str) -> bool:
         headers = {
             "accept": "*/*",
             "accept-language": "vi-VN,vi;q=0.9",
@@ -426,43 +425,12 @@ class TeamOutLook:
             logger.debug("%s - No refresh_token in response", self.mail)
             return False
 
-        rf = response.json()["refresh_token"]
-
-        # Exchange for loki token to validate
-        params = {
-            "client-request-id": "ba46b71e-fb4f-4a0d-bed8-4834081766dd",
-        }
-
-        data = (
-            f"client_id=5e3ce6c0-2b1f-4285-8d4b-75ee78787346"
-            f"&redirect_uri=https%3A%2F%2Fteams.microsoft.com%2Fv2%2Fauth"
-            f"&scope=https%3A%2F%2Floki.delve.office.com%2F%2F.default%20openid%20profile%20offline_access"
-            f"&grant_type=refresh_token&client_info=1"
-            f"&x-client-SKU=msal.js.browser&x-client-VER=3.30.0"
-            f"&x-ms-lib-capability=retry-after, h429"
-            f"&x-client-current-telemetry=5|61,0,,,|,"
-            f"&x-client-last-telemetry=5|0|||0,0"
-            f"&refresh_token={rf}"
-            f"&X-AnchorMailbox=Oid%3A4462d551-dfc1-459c-aa08-a2335ewqeqweqwede6ef2d%401b22c983-1cd9-4e21-9dab-be096b10f075"
-        )
-
-        response = self.session.post(
-            f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token",
-            params=params,
-            headers=headers,
-            data=data,
-        )
-
-        if "access_token" not in response.text:
-            logger.debug("%s - No access_token in exchange response", self.mail)
-            return False
-
-        self.access_token = response.json()["access_token"]
-        logger.info("%s - Token obtained (tenant: %s)", self.mail, self.tenant_id)
+        self.refresh_token = response.json()["refresh_token"]
+        logger.info("%s - Refresh token obtained (tenant: %s)", self.mail, self.tenant_id)
         return True
 
     def do_task(self) -> bool:
-        """Execute full browser flow: authorize → login → change pwd → get token."""
+        """Execute full browser flow: authorize → login → change pwd → get refresh token."""
         try:
             res_authorize = self.authorize_common()
             if not res_authorize:
@@ -490,7 +458,7 @@ class TeamOutLook:
             if not code_auth:
                 return False
 
-            return self.get_access_token(code_auth)
+            return self.get_refresh_token(code_auth)
 
         except Exception as e:
             logger.debug("%s - Error: %s", self.mail, e)
@@ -537,7 +505,7 @@ class BulkTokenGetter:
                         self.tokens.append(
                             {
                                 "email": user["email"],
-                                "access_token": obj.access_token,
+                                "refresh_token": obj.refresh_token,
                                 "tenant_id": obj.tenant_id,
                             }
                         )
@@ -565,7 +533,7 @@ class BulkTokenGetter:
 
     def run(self) -> dict:
         """
-        Execute bulk token retrieval.
+        Execute bulk refresh token retrieval.
 
         Returns:
             {

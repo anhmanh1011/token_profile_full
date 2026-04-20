@@ -146,7 +146,7 @@ def get_next_token():
             tok = token_queue.get_nowait()
             tokens.append({
                 "email": tok["email"],
-                "access_token": tok["access_token"],
+                "refresh_token": tok["refresh_token"],
                 "tenant_id": tok["tenant_id"],
             })
         except queue.Empty:

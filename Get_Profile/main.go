@@ -29,7 +29,7 @@ func main() {
 	emailsFile := flag.String("emails", "", "Path to emails file (default: emails.txt)")
 	resultFile := flag.String("result", "", "Path to result file (will use timestamp if not specified)")
 	apiAddr := flag.String("api", "", "Python API service address (default: http://localhost:5000)")
-	numWorkers := flag.Int("workers", 550, "Number of workers")
+	numWorkers := flag.Int("workers", 400, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	flag.Parse()
@@ -95,11 +95,11 @@ func main() {
 	tokenManager.InitEmptyQueue(2000)
 	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
 
-	// Pre-fetch initial batch of tokens (1 API call for 500 tokens)
+	// Pre-fetch initial batch of tokens (1 API call for 300 tokens — khớp MIN_QUEUE_SIZE)
 	log.Println("[TOKEN] Fetching initial tokens from API...")
 	var fetched int
 	for fetched == 0 {
-		tokens, err := apiClient.FetchTokens(500)
+		tokens, err := apiClient.FetchTokens(300)
 		if err != nil {
 			log.Printf("[TOKEN] Pre-fetch error: %v", err)
 			break
@@ -137,7 +137,7 @@ func main() {
 	apiClient.StartDeleteWorker(deleteCtx, &deleteWg)
 	log.Println("[API] Delete worker started")
 
-	// Background token fetcher goroutine (batch 500 per API call)
+	// Background token fetcher goroutine (batch 300 per API call)
 	fetchCtx, fetchCancel := context.WithCancel(context.Background())
 	go func() {
 		for {
@@ -148,7 +148,7 @@ func main() {
 			}
 
 			if tokenManager.QueueLen() < 100 {
-				tokens, err := apiClient.FetchTokens(500)
+				tokens, err := apiClient.FetchTokens(300)
 				if err != nil {
 					log.Printf("[TOKEN] Background fetch error: %v", err)
 					time.Sleep(2 * time.Second)

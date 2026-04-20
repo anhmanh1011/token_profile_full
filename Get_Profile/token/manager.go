@@ -3,6 +3,9 @@ package token
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -12,17 +15,28 @@ var (
 )
 
 const (
-	// QuotaExhaustedThreshold — số lần fail liên tiếp với status 500
-	// trước khi đánh dấu token exhausted và trigger delete user.
+	// QuotaExhaustedThreshold — số lần fail 500 liên tiếp trước khi đánh dấu token
+	// exhausted và delete user. Đặt thấp để kill nhanh token đã hết quota,
+	// tránh lãng phí CPM vào token hỏng.
 	QuotaExhaustedThreshold = 5
+
+	// accessTokenRefreshMargin — refresh access_token nếu sắp hết hạn trong khoảng này.
+	accessTokenRefreshMargin = 60 * time.Second
 )
 
-// TokenInfo stores the parsed token information
+// TokenInfo stores the parsed token information.
+// RefreshToken is stable for the ~24h refresh_token TTL; AccessToken is
+// minted from it via ExchangeRefreshToken and cached with ExpiresAt until
+// it nears expiry, then re-minted using the same RefreshToken.
 type TokenInfo struct {
-	Username    string
-	TenantID    string
+	Username     string
+	TenantID     string
+	RefreshToken string
+
+	mu          sync.Mutex // guards AccessToken + ExpiresAt swap during lazy exchange
 	AccessToken string
 	ExpiresAt   time.Time
+
 	dead        int32     // atomic flag: 0=alive, 1=dead
 	exhausted   int32     // atomic flag: 0=có quota, 1=hết quota
 	failCount   int32     // atomic: số lần fail liên tiếp với status 500
@@ -32,6 +46,9 @@ type TokenInfo struct {
 // Manager handles token acquisition from a channel-backed queue.
 type Manager struct {
 	tokenInfos []*TokenInfo
+
+	// HTTP client used for refresh_token → access_token exchange.
+	exchangeClient *http.Client
 
 	// Token queue — workers acquire/release here.
 	tokenQueue chan *TokenInfo
@@ -50,6 +67,9 @@ type Manager struct {
 func NewManager() *Manager {
 	return &Manager{
 		tokenInfos: make([]*TokenInfo, 0),
+		exchangeClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 }
 
@@ -71,46 +91,37 @@ func (m *Manager) AddToken(t *TokenInfo) {
 	}
 }
 
-// MarkQuotaExhausted marks a token as quota exhausted after consecutive 500 errors.
-// Returns true if token was marked as exhausted.
-func (m *Manager) MarkQuotaExhausted(accessToken string) bool {
-	total := int(atomic.LoadInt32(&m.totalTokens))
-
-	for idx := 0; idx < total; idx++ {
-		info := m.tokenInfos[idx]
-		if info.AccessToken == accessToken {
-			newCount := atomic.AddInt32(&info.failCount, 1)
-
-			if newCount >= QuotaExhaustedThreshold {
-				if atomic.CompareAndSwapInt32(&info.exhausted, 0, 1) {
-					info.exhaustedAt = time.Now()
-					atomic.AddInt32(&m.exhaustedCount, 1)
-					if m.deadChan != nil && info.Username != "" {
-						select {
-						case m.deadChan <- info.Username:
-						default:
-						}
-					}
-					return true
-				}
-			}
-			return false
+// MarkQuotaExhausted increments the consecutive-500 counter for token; when it
+// reaches QuotaExhaustedThreshold, marks the token exhausted and notifies the
+// dead channel for user cleanup. Returns true if the threshold was just crossed.
+func (m *Manager) MarkQuotaExhausted(token *TokenInfo) bool {
+	if token == nil {
+		return false
+	}
+	newCount := atomic.AddInt32(&token.failCount, 1)
+	if newCount < QuotaExhaustedThreshold {
+		return false
+	}
+	if !atomic.CompareAndSwapInt32(&token.exhausted, 0, 1) {
+		return false
+	}
+	token.exhaustedAt = time.Now()
+	atomic.AddInt32(&m.exhaustedCount, 1)
+	if m.deadChan != nil && token.Username != "" {
+		select {
+		case m.deadChan <- token.Username:
+		default:
 		}
 	}
-	return false
+	return true
 }
 
 // ResetFailCount resets the fail count for a token (call on successful API response).
-func (m *Manager) ResetFailCount(accessToken string) {
-	total := int(atomic.LoadInt32(&m.totalTokens))
-
-	for idx := 0; idx < total; idx++ {
-		info := m.tokenInfos[idx]
-		if info.AccessToken == accessToken {
-			atomic.StoreInt32(&info.failCount, 0)
-			return
-		}
+func (m *Manager) ResetFailCount(token *TokenInfo) {
+	if token == nil {
+		return
 	}
+	atomic.StoreInt32(&token.failCount, 0)
 }
 
 // Stats returns token statistics.
@@ -185,8 +196,10 @@ func (m *Manager) MarkDeadAndRelease(token *TokenInfo) {
 	}
 }
 
-// GetAccessToken returns current access token from TokenInfo.
-// Returns error if token is dead or expired (caller should mark dead and get new one).
+// GetAccessToken returns a valid Loki access_token for the given token,
+// lazily exchanging the refresh_token when the cached access_token is missing
+// or about to expire. Returns an error when the token is dead or the exchange
+// fails permanently (refresh_token revoked).
 func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 	if token == nil {
 		return "", ErrNoTokensAvailable
@@ -196,11 +209,29 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 		return "", fmt.Errorf("token is dead")
 	}
 
-	if token.AccessToken != "" && time.Now().Before(token.ExpiresAt) {
+	token.mu.Lock()
+	defer token.mu.Unlock()
+
+	if token.AccessToken != "" && time.Now().Before(token.ExpiresAt.Add(-accessTokenRefreshMargin)) {
 		return token.AccessToken, nil
 	}
 
-	return "", fmt.Errorf("token expired")
+	if token.RefreshToken == "" {
+		return "", fmt.Errorf("token has no refresh_token")
+	}
+
+	accessToken, expiresIn, err := ExchangeRefreshToken(m.exchangeClient, token.TenantID, token.RefreshToken)
+	if err != nil {
+		return "", err
+	}
+
+	token.AccessToken = accessToken
+	token.ExpiresAt = time.Now().Add(expiresIn)
+	slog.Info("token/manager: exchanged refresh_token",
+		"user", token.Username,
+		"expires_in", expiresIn,
+	)
+	return accessToken, nil
 }
 
 // QueueLen returns current queue length.

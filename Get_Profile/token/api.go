@@ -28,9 +28,9 @@ type APIClient struct {
 
 // fetchTokenResponse is a single token in the batch response.
 type fetchTokenResponse struct {
-	Email       string `json:"email"`
-	AccessToken string `json:"access_token"`
-	TenantID    string `json:"tenant_id"`
+	Email        string `json:"email"`
+	RefreshToken string `json:"refresh_token"`
+	TenantID     string `json:"tenant_id"`
 }
 
 // fetchBatchResponse is the JSON payload returned by GET /tokens/next?count=N.
@@ -96,10 +96,9 @@ func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
 			tokens := make([]*TokenInfo, 0, len(batch.Tokens))
 			for _, t := range batch.Tokens {
 				tokens = append(tokens, &TokenInfo{
-					Username:    t.Email,
-					AccessToken: t.AccessToken,
-					TenantID:    t.TenantID,
-					ExpiresAt:   time.Now().Add(50 * time.Minute),
+					Username:     t.Email,
+					RefreshToken: t.RefreshToken,
+					TenantID:     t.TenantID,
 				})
 			}
 			return tokens, nil
