@@ -77,11 +77,12 @@ admin_token.json
 | `token` | `exchange.go` | `ExchangeRefreshToken` — swap refresh_token → Loki access_token (2 retries on transient) |
 | `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo |
 | `api` | `client.go` | Loki API client, connection pooling, gzip |
-| `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode |
-| `reader` | `file.go` | Streaming email reader from file |
+| `progress` | `bitmap.go` | Line-indexed bitmap checkpoint (LoadOrCreate, atomic Set, SaveAtomic via tmp+rename, 10s auto-save) |
+| `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode, bitmap terminal-marking |
+| `reader` | `file.go` | Streaming email reader, per-line counter, bitmap skip; pushes via `pool.Submit` callback |
 | `writer` | `result.go` | Async buffered result writer |
 
-`main.go` wires everything — it is the only entry point. Required: `--api` flag (default `http://localhost:5000`).
+`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`.
 
 ### email-gen module structure
 
@@ -113,6 +114,7 @@ Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để g
 - **Token producer auto-refill**: Background thread keeps ≥100 tokens in `queue.Queue(maxsize=1000)`. Creates batch of 100 users at a time. Flask waits for queue to fill before accepting requests.
 - **Batch token API**: `GET /tokens/next?count=300` returns up to 300 tokens per call (cap server-side is 500). Go pre-fetches 300 tokens at startup, background goroutine refills 300 when pool < 100.
 - **Batch user deletion**: Go batches dead+exhausted token emails into groups of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge.
+- **Resume-safe bitmap checkpoint**: `progress.Bitmap` tracks per-line terminal processing (20 MB for 160M lines). Reader assigns `LineIdx` = physical line number (every line, including invalid — option A); on restart, lines with bit set are skipped. Workers set bit **only** on terminal outcomes (success, 403, 500-below-threshold, other 5xx, other errors) — **not** on requeue (401/424, exchange-fail, 500-exhausted). Auto-save every 10s via `os.Rename(tmp, final)` → crash-safe. Fingerprint = SHA-256 of (size ‖ first 64KB ‖ last 64KB); mismatch invalidates bitmap. First run counts lines once (~10s for 5 GB); subsequent runs read totalLines from header. Reader pushes jobs directly to `pool.jobsChan` via `pool.Submit` callback (single channel, no intermediate pump goroutine).
 
 ## Environments
 

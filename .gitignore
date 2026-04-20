@@ -8,10 +8,12 @@ admin_token.json
 *.log
 backup/
 *.exe
+Get_Profile/get_profile
 result_*.txt
 emails.txt
 emails_*.txt
 output_*.log
+*.ckpt
 
 # Rust (email-gen)
 email-gen/target/

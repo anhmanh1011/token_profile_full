@@ -2,133 +2,102 @@ package reader
 
 import (
 	"bufio"
+	"linkedin_fetcher/progress"
 	"os"
 	"strings"
 	"sync/atomic"
 )
 
+// EmailJob pairs an email with its line index in the source file. The
+// LineIdx is the 0-based position in emails.txt (every physical line,
+// including blanks/invalid — option A), used by the bitmap to track
+// terminal processing.
+type EmailJob struct {
+	Email   string
+	LineIdx int64
+}
+
 // EmailReader handles optimized reading of large email files
 type EmailReader struct {
 	filepath   string
 	bufferSize int
-	totalCount int64 // Counted during read
+	bitmap     *progress.Bitmap
+
+	totalCount int64 // emails actually pushed to channel
+	skipCount  int64 // lines skipped because bitmap bit set
 }
 
-// NewEmailReader creates a new email reader
-func NewEmailReader(filepath string, bufferSize int) *EmailReader {
+// NewEmailReader creates a new email reader. bitmap may be nil to disable
+// skip/tracking (useful for ad-hoc runs without a checkpoint).
+func NewEmailReader(filepath string, bufferSize int, bitmap *progress.Bitmap) *EmailReader {
 	return &EmailReader{
 		filepath:   filepath,
 		bufferSize: bufferSize,
+		bitmap:     bitmap,
 	}
 }
 
-// ReadEmails streams emails from file to a channel (memory efficient)
-// Returns channel, error channel, and pointer to count (updated during read)
-func (r *EmailReader) ReadEmailsWithCount() (<-chan string, <-chan error, *int64) {
-	// Large buffer for high throughput - 100K items
-	emailChan := make(chan string, 100000)
-	errChan := make(chan error, 1)
+// ReadJobsInto streams EmailJobs from file, skipping lines already set in the
+// bitmap, and invokes submit for each job in the same goroutine as the caller.
+// submit returns false if the downstream pool is shutting down, in which case
+// ReadJobsInto stops. Runs synchronously — caller owns the goroutine.
+func (r *EmailReader) ReadJobsInto(submit func(EmailJob) bool) error {
+	file, err := os.Open(r.filepath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 
-	go func() {
-		defer close(emailChan)
-		defer close(errChan)
+	rd := bufio.NewReaderSize(file, 4*1024*1024)
+	scanner := bufio.NewScanner(rd)
+	buf := make([]byte, r.bufferSize)
+	scanner.Buffer(buf, r.bufferSize)
 
-		file, err := os.Open(r.filepath)
-		if err != nil {
-			errChan <- err
-			return
+	var idx int64 = 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		start, end := 0, len(line)
+		for start < end && (line[start] == ' ' || line[start] == '\t' || line[start] == '\r' || line[start] == '\n') {
+			start++
 		}
-		defer file.Close()
+		for end > start && (line[end-1] == ' ' || line[end-1] == '\t' || line[end-1] == '\r' || line[end-1] == '\n') {
+			end--
+		}
 
-		// Use larger buffer for faster IO - 4MB
-		reader := bufio.NewReaderSize(file, 4*1024*1024)
-		scanner := bufio.NewScanner(reader)
-
-		// Set max token size for large lines
-		buf := make([]byte, r.bufferSize)
-		scanner.Buffer(buf, r.bufferSize)
-
-		var count int64
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			// Fast trim - avoid string conversion until needed
-			start, end := 0, len(line)
-			for start < end && (line[start] == ' ' || line[start] == '\t' || line[start] == '\r' || line[start] == '\n') {
-				start++
-			}
-			for end > start && (line[end-1] == ' ' || line[end-1] == '\t' || line[end-1] == '\r' || line[end-1] == '\n') {
-				end--
-			}
-
-			if start < end {
-				email := string(line[start:end])
-				if isValidEmailFast(email) {
-					count++
-					emailChan <- email
+		if start < end {
+			email := string(line[start:end])
+			if isValidEmailFast(email) {
+				if r.bitmap != nil && r.bitmap.Test(idx) {
+					atomic.AddInt64(&r.skipCount, 1)
+				} else {
+					atomic.AddInt64(&r.totalCount, 1)
+					if !submit(EmailJob{Email: email, LineIdx: idx}) {
+						// Pool shutting down, stop reading.
+						return nil
+					}
 				}
 			}
 		}
+		idx++ // option A: increment for every physical line
+	}
 
-		atomic.StoreInt64(&r.totalCount, count)
-
-		if err := scanner.Err(); err != nil {
-			errChan <- err
-		}
-	}()
-
-	return emailChan, errChan, &r.totalCount
+	return scanner.Err()
 }
 
-// ReadEmails for backward compatibility
-func (r *EmailReader) ReadEmails() (<-chan string, <-chan error) {
-	ch, errCh, _ := r.ReadEmailsWithCount()
-	return ch, errCh
-}
-
-// GetTotalCount returns the total count (available after read completes)
+// GetTotalCount returns the number of emails pushed to channel (excludes skipped).
 func (r *EmailReader) GetTotalCount() int64 {
 	return atomic.LoadInt64(&r.totalCount)
 }
 
-// CountEmails counts total emails in file using fast line counting
-func (r *EmailReader) CountEmails() (int, error) {
-	file, err := os.Open(r.filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	// Fast counting with large buffer
-	reader := bufio.NewReaderSize(file, 4*1024*1024)
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, r.bufferSize)
-	scanner.Buffer(buf, r.bufferSize)
-
-	count := 0
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) > 0 && containsAt(line) {
-			count++
-		}
-	}
-
-	return count, scanner.Err()
-}
-
-// containsAt fast check for @ symbol
-func containsAt(b []byte) bool {
-	for _, c := range b {
-		if c == '@' {
-			return true
-		}
-	}
-	return false
+// GetSkipCount returns the number of lines skipped via bitmap match.
+func (r *EmailReader) GetSkipCount() int64 {
+	return atomic.LoadInt64(&r.skipCount)
 }
 
 // isValidEmailFast performs fast email validation
 func isValidEmailFast(email string) bool {
 	n := len(email)
-	if n < 5 { // minimum: a@b.c
+	if n < 5 {
 		return false
 	}
 
@@ -138,7 +107,7 @@ func isValidEmailFast(email string) bool {
 	for i := 0; i < n; i++ {
 		if email[i] == '@' {
 			if atIdx != -1 || i == 0 {
-				return false // multiple @ or @ at start
+				return false
 			}
 			atIdx = i
 		} else if atIdx != -1 && email[i] == '.' {
@@ -149,7 +118,7 @@ func isValidEmailFast(email string) bool {
 	return atIdx > 0 && atIdx < n-1 && dotAfterAt
 }
 
-// isValidEmail for backward compatibility
+// isValidEmail kept for backward compatibility.
 func isValidEmail(email string) bool {
 	atIdx := strings.Index(email, "@")
 	if atIdx <= 0 || atIdx >= len(email)-1 {

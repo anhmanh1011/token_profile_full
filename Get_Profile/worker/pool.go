@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"linkedin_fetcher/api"
+	"linkedin_fetcher/progress"
+	"linkedin_fetcher/reader"
 	"linkedin_fetcher/token"
 	"linkedin_fetcher/writer"
 	"log"
@@ -20,9 +22,10 @@ type Pool struct {
 	apiClient    *api.Client
 	tokenManager *token.Manager
 	resultWriter *writer.ResultWriter
+	bitmap       *progress.Bitmap
 
 	// Channels - use larger buffer
-	jobsChan chan string
+	jobsChan chan reader.EmailJob
 
 	// Rate limiter
 	limiter *rate.Limiter
@@ -47,8 +50,9 @@ type Pool struct {
 	stoppedEarly int32 // Flag: stopped due to no tokens
 }
 
-// NewPool creates a new worker pool
-func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int) *Pool {
+// NewPool creates a new worker pool. bitmap may be nil to disable progress
+// tracking (all emails are processed without skip/set).
+func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int, bitmap *progress.Bitmap) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Use larger buffer for better throughput
@@ -75,11 +79,19 @@ func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager,
 		apiClient:    apiClient,
 		tokenManager: tokenManager,
 		resultWriter: resultWriter,
-		jobsChan:     make(chan string, bufferSize),
+		bitmap:       bitmap,
+		jobsChan:     make(chan reader.EmailJob, bufferSize),
 		limiter:      limiter,
 		failReasons:  make(map[string]*uint64),
 		ctx:          ctx,
 		cancel:       cancel,
+	}
+}
+
+// markDone sets the bitmap bit for a terminal outcome.
+func (p *Pool) markDone(job reader.EmailJob) {
+	if p.bitmap != nil {
+		p.bitmap.Set(job.LineIdx)
 	}
 }
 
@@ -123,14 +135,14 @@ func (p *Pool) Start() {
 	log.Printf("[POOL] Started %d workers", p.numWorkers)
 }
 
-// Submit submits an email for processing
-func (p *Pool) Submit(email string) bool {
+// Submit submits an email job for processing
+func (p *Pool) Submit(job reader.EmailJob) bool {
 	if atomic.LoadInt32(&p.closed) == 1 {
 		return false
 	}
 
 	select {
-	case p.jobsChan <- email:
+	case p.jobsChan <- job:
 		return true
 	case <-p.ctx.Done():
 		return false
@@ -173,16 +185,16 @@ func (p *Pool) StopReason() string {
 	return p.stopReason
 }
 
-// safeRequeue safely re-queues an email, avoiding send on closed channel
-func (p *Pool) safeRequeue(email string) {
+// safeRequeue safely re-queues a job, avoiding send on closed channel
+func (p *Pool) safeRequeue(job reader.EmailJob) {
 	if atomic.LoadInt32(&p.closed) == 1 {
-		return // Channel closed, drop the email
+		return // Channel closed, drop the job
 	}
 	select {
-	case p.jobsChan <- email:
+	case p.jobsChan <- job:
 		// Successfully re-queued
 	default:
-		// Channel full or closed, drop the email
+		// Channel full or closed, drop the job
 	}
 }
 
@@ -193,8 +205,8 @@ func (p *Pool) worker() {
 
 	for {
 		// 1. Acquire token from queue (blocks until available or closed)
-		token := p.tokenManager.AcquireToken()
-		if token == nil {
+		tok := p.tokenManager.AcquireToken()
+		if tok == nil {
 			// Queue closed, no more tokens
 			return
 		}
@@ -203,42 +215,42 @@ func (p *Pool) worker() {
 		//    GetAccessToken lazily exchanges refresh_token → access_token and
 		//    re-exchanges when the cached access_token nears expiry.
 		tokenDead := false
-		for email := range p.jobsChan {
+		for job := range p.jobsChan {
 			if tokenDead {
-				// Re-queue email and break to get new token
-				p.safeRequeue(email)
+				// Re-queue job and break to get new token
+				p.safeRequeue(job)
 				break
 			}
 
 			atomic.AddUint64(&p.processed, 1)
 
-			accessToken, err := p.tokenManager.GetAccessToken(token)
+			accessToken, err := p.tokenManager.GetAccessToken(tok)
 			if err != nil {
 				tokenDead = true
-				p.tokenManager.MarkDeadAndRelease(token)
+				p.tokenManager.MarkDeadAndRelease(tok)
 				log.Printf("[TOKEN] Exchange failed: %v — getting new token...", err)
-				p.safeRequeue(email)
+				p.safeRequeue(job)
 				break
 			}
 
 			// Wait for rate limit
 			if err := p.waitForRateLimit(); err != nil {
 				// Context cancelled
-				p.safeRequeue(email)
+				p.safeRequeue(job)
 				return
 			}
 
 			// Make API call
-			result, statusCode, err := p.apiClient.FetchProfile(email, accessToken)
+			result, statusCode, err := p.apiClient.FetchProfile(job.Email, accessToken)
 
 			// Handle token death (401/424)
 			if statusCode == 401 || statusCode == 424 {
 				tokenDead = true
-				p.tokenManager.MarkDeadAndRelease(token)
+				p.tokenManager.MarkDeadAndRelease(tok)
 				total, alive, dead := p.tokenManager.Stats()
 				log.Printf("[TOKEN] Token dead (status %d)! Total: %d, Alive: %d, Dead: %d", statusCode, total, alive, dead)
 				// Re-queue email to be processed with new token
-				p.safeRequeue(email)
+				p.safeRequeue(job)
 				break
 			}
 
@@ -246,6 +258,7 @@ func (p *Pool) worker() {
 			if statusCode == 403 {
 				p.trackFailReason("status_403")
 				atomic.AddUint64(&p.failed, 1)
+				p.markDone(job)
 				time.Sleep(500 * time.Millisecond) // Backoff khi bị rate limit
 				continue
 			}
@@ -255,21 +268,24 @@ func (p *Pool) worker() {
 			if statusCode == 500 {
 				p.trackFailReason("status_500")
 				atomic.AddUint64(&p.failed, 1)
-				if p.tokenManager.MarkQuotaExhausted(token) {
+				if p.tokenManager.MarkQuotaExhausted(tok) {
 					tokenDead = true
 					_, alive, _, exhausted := p.tokenManager.FullStats()
 					log.Printf("[TOKEN] Token exhausted (consecutive 500s)! Alive: %d, Exhausted: %d", alive, exhausted)
-					p.safeRequeue(email)
+					p.safeRequeue(job)
 					break
 				}
+				// Below threshold: email consumed a request with this token; mark terminal.
+				p.markDone(job)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
 
-			// Handle other 5xx - transient server error: backoff + retry với cùng token.
+			// Handle other 5xx - transient server error: backoff + continue with same token.
 			if statusCode >= 500 {
 				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
 				atomic.AddUint64(&p.failed, 1)
+				p.markDone(job)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -277,7 +293,7 @@ func (p *Pool) worker() {
 			// Success
 			if err == nil {
 				// Reset fail count khi request thành công
-				p.tokenManager.ResetFailCount(token)
+				p.tokenManager.ResetFailCount(tok)
 
 				atomic.AddUint64(&p.successful, 1)
 				if result != nil {
@@ -286,6 +302,7 @@ func (p *Pool) worker() {
 						log.Printf("[WRITER] Failed to write result: %v", writeErr)
 					}
 				}
+				p.markDone(job)
 				continue
 			}
 
@@ -296,11 +313,12 @@ func (p *Pool) worker() {
 				p.trackFailReason("connection_error")
 			}
 			atomic.AddUint64(&p.failed, 1)
+			p.markDone(job)
 		}
 
 		// Token was dead or jobsChan closed, return token if still alive
 		if !tokenDead {
-			p.tokenManager.ReleaseToken(token)
+			p.tokenManager.ReleaseToken(tok)
 		}
 
 		// Check if jobsChan is closed
@@ -365,10 +383,18 @@ func (p *Pool) StartProgressReporter(interval time.Duration, totalEmails int) {
 				lastSuccessful = successful
 				lastTime = now
 
-				// Progress
+				// Progress: prefer bitmap-backed total if available.
 				progress := float64(0)
-				if totalEmails > 0 {
+				var doneLabel string
+				if p.bitmap != nil && p.bitmap.TotalLines() > 0 {
+					done := p.bitmap.Done()
+					progress = float64(done) / float64(p.bitmap.TotalLines()) * 100
+					doneLabel = fmt.Sprintf("Done: %d/%d", done, p.bitmap.TotalLines())
+				} else if totalEmails > 0 {
 					progress = float64(processed) / float64(totalEmails) * 100
+					doneLabel = fmt.Sprintf("Processed: %d/%d", processed, totalEmails)
+				} else {
+					doneLabel = fmt.Sprintf("Processed: %d", processed)
 				}
 
 				successPct := float64(0)
@@ -379,8 +405,8 @@ func (p *Pool) StartProgressReporter(interval time.Duration, totalEmails int) {
 				// Token stats
 				totalTokens, aliveTokens, deadTokens, exhaustedTokens := p.tokenManager.FullStats()
 
-				log.Printf("[PROGRESS] %.1f%% | Processed: %d | Success: %d (%.1f%%) | Failed: %d | HIT: %d | CPM: %.0f | RealCPM: %.0f | Tokens[A:%d/D:%d/E:%d/%d]",
-					progress, processed, successful, successPct, failed, exactMatch, successCPM, realtimeCPM,
+				log.Printf("[PROGRESS] %.2f%% | %s | Success: %d (%.1f%%) | Failed: %d | HIT: %d | CPM: %.0f | RealCPM: %.0f | Tokens[A:%d/D:%d/E:%d/%d]",
+					progress, doneLabel, successful, successPct, failed, exactMatch, successCPM, realtimeCPM,
 					aliveTokens, deadTokens, exhaustedTokens, totalTokens)
 
 			case <-tokenCheckTicker.C:

@@ -10,6 +10,7 @@ import (
 	"io"
 	"linkedin_fetcher/api"
 	"linkedin_fetcher/config"
+	"linkedin_fetcher/progress"
 	"linkedin_fetcher/reader"
 	"linkedin_fetcher/token"
 	"linkedin_fetcher/worker"
@@ -32,6 +33,7 @@ func main() {
 	numWorkers := flag.Int("workers", 400, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
+	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.ckpt)")
 	flag.Parse()
 
 	// Generate timestamped filenames
@@ -76,15 +78,30 @@ func main() {
 		cfg.MaxCPM = *maxCPM
 	}
 
+	ckptPath := *checkpointFile
+	if ckptPath == "" {
+		ckptPath = cfg.EmailsFile + ".ckpt"
+	}
+
 	log.Printf("[CONFIG] Workers: %d | APITimeout: %ds | EmailBuffer: %d | MaxCPM: %d",
 		cfg.NumWorkers, cfg.APITimeout, cfg.EmailBufferSize, cfg.MaxCPM)
 	log.Printf("[CONFIG] API: %s", cfg.APIAddr)
-	log.Printf("[FILES] Emails: %s | Result: %s", cfg.EmailsFile, cfg.ResultsFile)
+	log.Printf("[FILES] Emails: %s | Result: %s | Checkpoint: %s", cfg.EmailsFile, cfg.ResultsFile, ckptPath)
 
 	// Check if emails file exists
 	if _, err := os.Stat(cfg.EmailsFile); os.IsNotExist(err) {
 		log.Fatalf("[ERROR] Emails file not found: %s", cfg.EmailsFile)
 	}
+
+	// Load or create progress bitmap (skip lines already processed in prior runs).
+	bitmap, err := progress.LoadOrCreate(ckptPath, cfg.EmailsFile)
+	if err != nil {
+		log.Fatalf("[CHECKPOINT] %v", err)
+	}
+	stopAutoSave := bitmap.StartAutoSaver(10 * time.Second)
+	defer stopAutoSave()
+	totalEmails := int(bitmap.TotalLines())
+	log.Printf("[CHECKPOINT] Total lines: %d | Already done: %d", totalEmails, bitmap.Done())
 
 	// Create API client for token fetching and user deletion
 	apiClient := token.NewAPIClient(cfg.APIAddr)
@@ -169,10 +186,8 @@ func main() {
 	}()
 	log.Println("[TOKEN] Background token fetcher started")
 
-	// Initialize email reader
-	emailReader := reader.NewEmailReader(cfg.EmailsFile, cfg.FileBufferSize)
-	totalEmails := 0
-	log.Printf("[READER] Skipping email count for faster startup")
+	// Initialize email reader (with bitmap for skip).
+	emailReader := reader.NewEmailReader(cfg.EmailsFile, cfg.FileBufferSize, bitmap)
 
 	// Initialize result writer
 	resultWriter, err := writer.NewResultWriter(cfg.ResultsFile)
@@ -187,7 +202,7 @@ func main() {
 	log.Println("[API] Loki client initialized")
 
 	// Initialize worker pool
-	pool := worker.NewPool(cfg.NumWorkers, lokiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM)
+	pool := worker.NewPool(cfg.NumWorkers, lokiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM, bitmap)
 	pool.StartProgressReporter(5*time.Second, totalEmails)
 	pool.Start()
 
@@ -195,9 +210,9 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Start reading emails
+	// Start reading emails. Reader pushes directly into pool's channel via
+	// pool.Submit — no intermediate channel, no pump goroutine.
 	startTime := time.Now()
-	emailChan, errChan := emailReader.ReadEmails()
 
 	done := make(chan struct{})
 	var closeOnce sync.Once
@@ -208,10 +223,7 @@ func main() {
 	}
 
 	go func() {
-		for email := range emailChan {
-			pool.Submit(email)
-		}
-		if err := <-errChan; err != nil {
+		if err := emailReader.ReadJobsInto(pool.Submit); err != nil {
 			log.Printf("[ERROR] Failed to read emails: %v", err)
 		}
 		pool.Close()
@@ -249,10 +261,13 @@ func main() {
 	}
 
 	log.Printf("Total Emails:    %d", totalEmails)
+	log.Printf("Skipped (done):  %d", emailReader.GetSkipCount())
+	log.Printf("Submitted:       %d", emailReader.GetTotalCount())
 	log.Printf("Processed:       %d", processed)
 	log.Printf("Successful:      %d", successful)
 	log.Printf("Failed:          %d", failed)
 	log.Printf("ExactMatch:      %d", exactMatch)
+	log.Printf("Bitmap Done:     %d / %d", bitmap.Done(), bitmap.TotalLines())
 	log.Printf("Results Written: %d", resultWriter.Count())
 	log.Printf("Elapsed Time:    %s", elapsed.Round(time.Second))
 	if elapsed.Seconds() > 0 {
@@ -264,6 +279,7 @@ func main() {
 
 	fmt.Println(repeatString("=", 60))
 	log.Printf("Results saved to: %s", cfg.ResultsFile)
+	log.Printf("Checkpoint saved to: %s", ckptPath)
 
 	if pool.StoppedEarly() {
 		log.Printf("Application stopped early: %s", pool.StopReason())
