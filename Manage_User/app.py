@@ -201,6 +201,19 @@ def delete_users():
     return jsonify({"deleted": deleted, "failed": failed}), 200
 
 
+@app.get("/proxy")
+def get_proxy():
+    """Return the SOCKS5 proxy URL configured for the current admin.
+
+    Returns:
+        200: {"proxy": "socks5h://..."} or {"proxy": null} if no proxy configured.
+        503: {"error": "..."}  — service not initialised yet
+    """
+    if _token_mgr is None:
+        return jsonify({"error": "Service not initialised"}), 503
+    return jsonify({"proxy": _token_mgr.proxy_url}), 200
+
+
 @app.get("/status")
 def get_status():
     """Return current service stats.

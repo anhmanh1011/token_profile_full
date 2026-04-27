@@ -96,10 +96,20 @@ class TokenProducer:
 
         logger.info("Created %d users, getting tokens...", len(created_users))
 
-        # Step 2: Get refresh tokens
-        getter = BulkTokenGetter(created_users)
+        # Step 2: Get refresh tokens (browser flow goes through the same SOCKS5
+        # proxy as the admin session, so geolocation stays consistent).
+        getter = BulkTokenGetter(created_users, proxy=self.token_mgr.proxy_url)
         token_result = getter.run()
         tokens = token_result["tokens"]
+
+        # Fallback: TeamOutLook scrapes tenant_id from MS response headers; when
+        # that regex misses (header format changes) the field comes back empty.
+        # All bot_* users are created in the admin's tenant, so use it as the
+        # default — Go's exchange step needs a non-empty tenant_id.
+        admin_tenant = self.token_mgr.tenant_id
+        for tok in tokens:
+            if not tok.get("tenant_id"):
+                tok["tenant_id"] = admin_tenant
 
         with self.stats_lock:
             self.total_tokens += len(tokens)

@@ -34,6 +34,7 @@ func main() {
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.ckpt)")
+	proxyOverride := flag.String("proxy", "", "SOCKS5 proxy override; empty = fetch from Python /proxy endpoint")
 	flag.Parse()
 
 	// Generate timestamped filenames
@@ -103,12 +104,29 @@ func main() {
 	totalEmails := int(bitmap.TotalLines())
 	log.Printf("[CHECKPOINT] Total lines: %d | Already done: %d", totalEmails, bitmap.Done())
 
-	// Create API client for token fetching and user deletion
+	// Create API client for token fetching and user deletion (always direct,
+	// since the Python service is on localhost — must NOT go through SOCKS5).
 	apiClient := token.NewAPIClient(cfg.APIAddr)
 	log.Printf("[API] Token API client initialized: %s", cfg.APIAddr)
 
+	// Resolve SOCKS5 proxy: --proxy flag overrides; otherwise ask the Python
+	// service which proxy is bound to the current admin in admin_token.json.
+	cfg.Proxy = *proxyOverride
+	if cfg.Proxy == "" {
+		if p, err := apiClient.FetchProxy(); err != nil {
+			log.Printf("[PROXY] Failed to fetch /proxy from Python service: %v (continuing direct)", err)
+		} else {
+			cfg.Proxy = p
+		}
+	}
+	if cfg.Proxy != "" {
+		log.Printf("[PROXY] SOCKS5 enabled for Loki + token-exchange traffic")
+	} else {
+		log.Println("[PROXY] No proxy configured — direct dialing")
+	}
+
 	// Initialize token manager with empty queue
-	tokenManager := token.NewManager()
+	tokenManager := token.NewManagerWithProxy(cfg.Proxy)
 	tokenManager.InitEmptyQueue(2000)
 	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
 
@@ -197,8 +215,8 @@ func main() {
 	defer resultWriter.Close()
 	log.Printf("[WRITER] Output file: %s", cfg.ResultsFile)
 
-	// Initialize Loki API client
-	lokiClient := api.NewClient(cfg.APITimeout)
+	// Initialize Loki API client (Loki traffic flows through SOCKS5 if configured).
+	lokiClient := api.NewClientWithProxy(cfg.APITimeout, cfg.Proxy)
 	log.Println("[API] Loki client initialized")
 
 	// Initialize worker pool

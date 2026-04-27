@@ -56,6 +56,33 @@ func NewAPIClient(baseURL string) *APIClient {
 	}
 }
 
+// FetchProxy calls GET {baseURL}/proxy and returns the SOCKS5 proxy URL the
+// Python service is configured to use, or "" if none. Errors are returned to
+// the caller so startup can decide whether to fall back to direct dialing.
+func (c *APIClient) FetchProxy() (string, error) {
+	resp, err := c.httpClient.Get(c.baseURL + "/proxy") //nolint:noctx
+	if err != nil {
+		return "", fmt.Errorf("token/api: fetch proxy: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("token/api: read proxy body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token/api: proxy endpoint status %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("token/api: parse proxy response: %w", err)
+	}
+	return parsed.Proxy, nil
+}
+
 // FetchTokens calls GET {baseURL}/tokens/next?count=N and returns up to N tokens.
 // Returns nil (empty slice) when the queue is empty (202); caller should retry.
 // Connection errors are retried up to 3 times with a 5-second pause.

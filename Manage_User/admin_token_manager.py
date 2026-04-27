@@ -14,6 +14,8 @@ from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from proxy_config import parse_proxy, proxies_dict
+
 logger = logging.getLogger(__name__)
 
 CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
@@ -27,6 +29,7 @@ class AdminTokenManager:
         self.tenant_id = admin["tenant_id"]
         self.refresh_token = admin["refresh_token"]
         self.domain = admin.get("domain", "")
+        self.proxy_url: Optional[str] = parse_proxy(admin.get("proxy"))
 
         self._access_token: Optional[str] = None
         self._token_expires: float = 0
@@ -40,6 +43,9 @@ class AdminTokenManager:
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
         self.session.mount("https://", adapter)
+        if self.proxy_url:
+            self.session.proxies.update(proxies_dict(self.proxy_url))
+            logger.info("AdminTokenManager: SOCKS5 proxy enabled")
 
     def get_token(self) -> Optional[str]:
         """Get a valid access_token, refreshing if expired. Thread-safe."""

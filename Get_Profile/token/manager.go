@@ -3,6 +3,7 @@ package token
 import (
 	"errors"
 	"fmt"
+	"linkedin_fetcher/proxy"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -63,12 +64,33 @@ type Manager struct {
 	deadChan chan<- string
 }
 
-// NewManager creates a new token manager
+// NewManager creates a new token manager with no proxy.
 func NewManager() *Manager {
+	return NewManagerWithProxy("")
+}
+
+// NewManagerWithProxy creates a token manager whose refresh_token →
+// access_token exchange traffic flows through the SOCKS5 proxy at proxyURL.
+// Pass an empty string to dial directly. Malformed proxy URLs degrade to
+// direct dialing with a logged error rather than failing startup.
+func NewManagerWithProxy(proxyURL string) *Manager {
+	dial, err := proxy.SOCKS5DialContext(proxy.Parse(proxyURL), 5*time.Second, 30*time.Second)
+	if err != nil {
+		slog.Error("token/manager: failed to build SOCKS5 dialer, falling back to direct", "err", err)
+		dial, _ = proxy.SOCKS5DialContext("", 5*time.Second, 30*time.Second)
+	}
 	return &Manager{
 		tokenInfos: make([]*TokenInfo, 0),
 		exchangeClient: &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           dial,
+				MaxIdleConns:          200,
+				MaxIdleConnsPerHost:   100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 		},
 	}
 }

@@ -23,6 +23,8 @@ from typing import Optional
 
 from curl_cffi import requests
 
+from proxy_config import parse_proxy, proxies_dict
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKERS = 30
@@ -36,21 +38,13 @@ class TeamOutLook:
         self.pwd = password
         self.newpwd = self.pwd + "1"
         self.session = requests.Session(impersonate="firefox135", timeout=60)
-        self.data_proxy = None
         self.tenant_id = ""
 
-        if proxy:
-            parts = proxy.split(":")
-            if len(parts) == 2:
-                self.proxyies = proxy
-            else:
-                self.proxyies = (
-                    f"{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-                )
-            self.data_proxy = {
-                "http": f"http://{self.proxyies}",
-                "https": f"http://{self.proxyies}",
-            }
+        # Accept either the legacy host:port:user:pass form or a full URL.
+        # parse_proxy returns a socks5h:// URL ready for libcurl.
+        self.proxy_url: Optional[str] = parse_proxy(proxy)
+        self.data_proxy: dict = proxies_dict(self.proxy_url)
+        if self.data_proxy:
             self.session.proxies.update(self.data_proxy)
 
         # Results

@@ -8,6 +8,10 @@ type Config struct {
 	// API settings
 	APIAddr string // Python API service address
 
+	// SOCKS5 proxy URL applied to Loki + token-exchange clients.
+	// Empty = no proxy. Localhost calls to APIAddr never go through it.
+	Proxy string
+
 	// Worker settings
 	NumWorkers int
 
