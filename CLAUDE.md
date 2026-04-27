@@ -38,19 +38,23 @@ Three independent apps on the same VPS:
 **No Redis required.** Manage_User ↔ Get_Profile giao tiếp qua HTTP localhost. email-gen độc lập, user chạy tay sinh file.
 
 ```
-admin_token.json
+admin_token.json (refresh_token + tenant_id + proxy)
        │
        ▼
   [Manage_User API Service]  (Python, localhost:5000)
   StartupCleaner → TokenProducer (background thread)
+  Admin OAuth + token_getter → SOCKS5 (socks5h://, DNS qua proxy)
        │
        ├── GET  /tokens/next    → refresh_token (Go tự exchange sang access_token)
        ├── POST /users/delete   → batch delete users
+       ├── GET  /proxy          → expose SOCKS5 URL cho Go startup
        └── GET  /status         → monitoring
        │
        ▼
   [Get_Profile]  (Go, batch job)
   APIClient → TokenManager → WorkerPool(400) → Loki API → result.txt
+  Loki + token-exchange clients → SOCKS5 (qua x/net/proxy);
+  /tokens/next & /users/delete → direct (localhost)
        │
        └── POST /users/delete (batch 20, dead token cleanup)
 ```
@@ -63,9 +67,10 @@ admin_token.json
 | `cleanup.py` | `StartupCleaner` | `AdminTokenManager` | `{found, deleted, failed, purged}` — soft-delete + permanently purge `bot_` users |
 | `creator.py` | `BulkUserCreator` | `AdminTokenManager`, count | `{created_users: [{email, password}], failed, licensed}` |
 | `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, refresh_token, tenant_id}], failed}` |
-| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥100 tokens in queue |
+| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥100 tokens in queue; passes admin proxy to BulkTokenGetter; backfills missing tenant_id with admin tenant |
 | `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` | `_process_batch(emails)` → `[{email, success, [error]}]` per email |
-| `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point) |
+| `proxy_config.py` | `parse_proxy`, `proxies_dict` | `host:port[:user:pass]` hoặc URL | Helpers normalize to `socks5h://` URL + build `requests`/`curl_cffi` proxies dict |
+| `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point); exposes `/proxy` |
 
 `app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth.
 
@@ -73,16 +78,17 @@ admin_token.json
 
 | Package | File | Responsibility |
 |---------|------|----------------|
-| `token` | `api.go` | HTTP client for Python API (`/tokens/next`, `/users/delete`) |
+| `token` | `api.go` | HTTP client for Python API (`/tokens/next`, `/users/delete`, `/proxy`) |
 | `token` | `exchange.go` | `ExchangeRefreshToken` — swap refresh_token → Loki access_token (2 retries on transient) |
-| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo |
-| `api` | `client.go` | Loki API client, connection pooling, gzip |
+| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo; `NewManagerWithProxy` builds proxied HTTP client for token exchange |
+| `api` | `client.go` | Loki API client, connection pooling, gzip; `NewClientWithProxy` routes via SOCKS5 dialer |
+| `proxy` | `proxy.go` | `Parse` (legacy `host:port[:user:pass]` → `socks5h://` URL) + `SOCKS5DialContext` (x/net/proxy, hostname resolution on proxy side, no DNS leak) |
 | `progress` | `bitmap.go` | Line-indexed bitmap checkpoint (LoadOrCreate, atomic Set, SaveAtomic via tmp+rename, 10s auto-save) |
 | `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode, bitmap terminal-marking |
 | `reader` | `file.go` | Streaming email reader, per-line counter, bitmap skip; pushes via `pool.Submit` callback |
 | `writer` | `result.go` | Async buffered result writer |
 
-`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`.
+`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`, `--proxy` (override; empty = fetch once from Python `/proxy`).
 
 ### email-gen module structure
 
@@ -115,6 +121,7 @@ Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để g
 - **Batch token API**: `GET /tokens/next?count=300` returns up to 300 tokens per call (cap server-side is 500). Go pre-fetches 300 tokens at startup, background goroutine refills 300 when pool < 100.
 - **Batch user deletion**: Go batches dead+exhausted token emails into groups of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge.
 - **Resume-safe bitmap checkpoint**: `progress.Bitmap` tracks per-line terminal processing (20 MB for 160M lines). Reader assigns `LineIdx` = physical line number (every line, including invalid — option A); on restart, lines with bit set are skipped. Workers set bit **only** on terminal outcomes (success, 403, 500-below-threshold, other 5xx, other errors) — **not** on requeue (401/424, exchange-fail, 500-exhausted). Auto-save every 10s via `os.Rename(tmp, final)` → crash-safe. Fingerprint = SHA-256 of (size ‖ first 64KB ‖ last 64KB); mismatch invalidates bitmap. First run counts lines once (~10s for 5 GB); subsequent runs read totalLines from header. Reader pushes jobs directly to `pool.jobsChan` via `pool.Submit` callback (single channel, no intermediate pump goroutine).
+- **SOCKS5 proxy (single source of truth)**: `proxy` field of `admin_token.json` carries the SOCKS5 (legacy `host:port[:user:pass]` or `socks5h://...` URL). `proxy_config.parse_proxy` normalises to `socks5h://` so DNS resolves on the proxy (no leak, geolocation consistent for MS login). Manage_User: AdminTokenManager session + token_getter (`curl_cffi`) both route through it. Get_Profile: at startup `--proxy` overrides; otherwise calls `GET /proxy` **once** to fetch the URL — no runtime reload. The same dialer is shared by Loki client (`api.NewClientWithProxy`) and refresh-token exchange (`token.NewManagerWithProxy`). Localhost API calls (`/tokens/next`, `/users/delete`) always go direct. Changing the proxy in `Manage_User/admin_token.json` requires **restarting Get_Profile** (Manage_User picks it up next admin-OAuth refresh).
 
 ## Environments
 

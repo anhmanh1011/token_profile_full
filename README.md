@@ -37,17 +37,20 @@ cd email-gen && cargo build --release
 ## Kiến trúc tổng quan
 
 ```
-admin_token.json (input)
+admin_token.json (refresh_token + tenant_id + proxy)
        │
        ▼
   [Manage_User API Service]  ← Python (localhost:5000)
+   (admin OAuth + token_getter đều route qua SOCKS5)
        │
        ├── GET  /tokens/next      (refresh_token — Go tự exchange sang access_token)
        ├── POST /users/delete     (batch delete)
+       ├── GET  /proxy            (SOCKS5 URL hiện tại)
        └── GET  /status           (monitoring)
        │
        ▼
   [Get_Profile]  ← Go (batch job)
+   (Loki + token-exchange route qua SOCKS5; localhost API thì direct)
        │
        ├── emails.txt (input: emails cần check)
        └── result_TIMESTAMP.txt (output: LinkedIn profiles)
@@ -59,6 +62,7 @@ admin_token.json (input)
 |--------|------|----------|-------|
 | `GET` | `/tokens/next?count=N` | `{"tokens": [...], "count": N}` hoặc 202 | Lấy batch tokens (default 100, max 500) |
 | `POST` | `/users/delete` | `{"deleted": N, "failed": N}` | Batch delete users |
+| `GET` | `/proxy` | `{"proxy": "socks5h://..."}` hoặc `{"proxy": null}` | SOCKS5 URL bound to current admin |
 | `GET` | `/status` | `{"queue_size", "total_created", ...}` | Monitoring |
 
 ## Yêu cầu
@@ -94,7 +98,16 @@ go build -o get_profile.exe .
 | `--max-cpm` | `20000` | Max requests per minute |
 | `--emails` | `emails.txt` | Path to emails file |
 | `--result` | `result_TIMESTAMP.txt` | Path to result file |
+| `--checkpoint` | `<emails>.ckpt` | Bitmap progress file |
+| `--proxy` | (fetch từ Python `/proxy`) | SOCKS5 override; chấp nhận `host:port[:user:pass]` hoặc `socks5h://...` |
 | `--id` | | Instance ID for logging |
+
+**Proxy resolution** (Get_Profile, startup only — không reload runtime):
+1. Nếu có `--proxy` flag → dùng luôn.
+2. Ngược lại gọi `GET /proxy` của Python service (1 lần) → lấy proxy của admin hiện tại.
+3. Nếu Python service down hoặc không có proxy → fallback direct dial (cảnh báo IP thật).
+
+Đổi proxy: sửa field `proxy` trong `Manage_User/admin_token.json` rồi **restart Get_Profile** (Python service tự reload).
 
 ### Manage_User flags
 
