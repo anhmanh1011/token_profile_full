@@ -12,6 +12,7 @@ Endpoints:
 import json
 import logging
 import queue
+import re
 import sys
 import threading
 import time
@@ -28,6 +29,10 @@ from producer import TokenProducer
 
 CONFIG_FILE = Path(__file__).parent / "admin_token.json"
 LOG_FILE = Path(__file__).parent / "service.log"
+MAX_DELETE_EMAILS = 20
+EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -78,6 +83,19 @@ def _load_admin_config() -> dict:
         raise ValueError(f"{CONFIG_FILE} must be a non-empty JSON array")
 
     return admins[0]
+
+
+def _validate_delete_emails(emails: list) -> str | None:
+    if len(emails) > MAX_DELETE_EMAILS:
+        return f"emails list must contain at most {MAX_DELETE_EMAILS} items"
+
+    for email in emails:
+        if not isinstance(email, str):
+            return "all emails must be strings"
+        if len(email) > 254 or not EMAIL_PATTERN.fullmatch(email):
+            return f"invalid email: {email!r}"
+
+    return None
 
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
@@ -170,16 +188,20 @@ def delete_users():
         400: {"error": "..."}  — malformed request
         503: {"error": "..."}  — service not initialised yet
     """
-    if _token_mgr is None:
-        return jsonify({"error": "Service not initialised"}), 503
-
     body = request.get_json(silent=True)
     if not body or not isinstance(body.get("emails"), list):
         return jsonify({"error": "Request body must be JSON with 'emails' list"}), 400
 
     emails: list[str] = body["emails"]
+    validation_error = _validate_delete_emails(emails)
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+
     if not emails:
         return jsonify({"deleted": 0, "failed": 0}), 200
+
+    if _token_mgr is None:
+        return jsonify({"error": "Service not initialised"}), 503
 
     # Soft-delete via Graph API
     deleter = FastBulkDeleter(_token_mgr)

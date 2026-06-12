@@ -3,7 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
-	"linkedin_fetcher/api"
+	"linkedin_fetcher/models"
 	"linkedin_fetcher/progress"
 	"linkedin_fetcher/reader"
 	"linkedin_fetcher/token"
@@ -16,15 +16,20 @@ import (
 	"golang.org/x/time/rate"
 )
 
+type profileClient interface {
+	FetchProfile(email, token string) (*models.Result, int, error)
+}
+
 // Pool manages a pool of workers for concurrent API calls
 type Pool struct {
 	numWorkers   int
-	apiClient    *api.Client
+	apiClient    profileClient
 	tokenManager *token.Manager
 	resultWriter *writer.ResultWriter
 	bitmap       *progress.Bitmap
 
 	// Channels - use larger buffer
+	jobsMu   sync.RWMutex
 	jobsChan chan reader.EmailJob
 
 	// Rate limiter
@@ -52,7 +57,7 @@ type Pool struct {
 
 // NewPool creates a new worker pool. bitmap may be nil to disable progress
 // tracking (all emails are processed without skip/set).
-func NewPool(numWorkers int, apiClient *api.Client, tokenManager *token.Manager, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int, bitmap *progress.Bitmap) *Pool {
+func NewPool(numWorkers int, apiClient profileClient, tokenManager *token.Manager, resultWriter *writer.ResultWriter, bufferSize int, maxCPM int, bitmap *progress.Bitmap) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Use larger buffer for better throughput
@@ -93,6 +98,11 @@ func (p *Pool) markDone(job reader.EmailJob) {
 	if p.bitmap != nil {
 		p.bitmap.Set(job.LineIdx)
 	}
+}
+
+func (p *Pool) markTerminal(job reader.EmailJob) {
+	atomic.AddUint64(&p.processed, 1)
+	p.markDone(job)
 }
 
 // waitForRateLimit waits for rate limiter if enabled
@@ -141,6 +151,13 @@ func (p *Pool) Submit(job reader.EmailJob) bool {
 		return false
 	}
 
+	p.jobsMu.RLock()
+	defer p.jobsMu.RUnlock()
+
+	if atomic.LoadInt32(&p.closed) == 1 {
+		return false
+	}
+
 	select {
 	case p.jobsChan <- job:
 		return true
@@ -153,7 +170,9 @@ func (p *Pool) Submit(job reader.EmailJob) bool {
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		atomic.StoreInt32(&p.closed, 1)
+		p.jobsMu.Lock()
 		close(p.jobsChan)
+		p.jobsMu.Unlock()
 	})
 	p.wg.Wait()
 }
@@ -185,27 +204,16 @@ func (p *Pool) StopReason() string {
 	return p.stopReason
 }
 
-// safeRequeue safely re-queues a job, avoiding send on closed channel
-func (p *Pool) safeRequeue(job reader.EmailJob) {
-	if atomic.LoadInt32(&p.closed) == 1 {
-		return // Channel closed, drop the job
-	}
-	select {
-	case p.jobsChan <- job:
-		// Successfully re-queued
-	default:
-		// Channel full or closed, drop the job
-	}
-}
-
 // worker is the worker goroutine — each worker holds one token from the queue
 // and processes emails with it until the token dies.
 func (p *Pool) worker() {
 	defer p.wg.Done()
 
+	var retryJob *reader.EmailJob
+
 	for {
 		// 1. Acquire token from queue (blocks until available or closed)
-		tok := p.tokenManager.AcquireToken()
+		tok := p.tokenManager.AcquireToken(p.ctx)
 		if tok == nil {
 			// Queue closed, no more tokens
 			return
@@ -215,28 +223,38 @@ func (p *Pool) worker() {
 		//    GetAccessToken lazily exchanges refresh_token → access_token and
 		//    re-exchanges when the cached access_token nears expiry.
 		tokenDead := false
-		for job := range p.jobsChan {
-			if tokenDead {
-				// Re-queue job and break to get new token
-				p.safeRequeue(job)
-				break
+		for {
+			var job reader.EmailJob
+			if retryJob != nil {
+				job = *retryJob
+				retryJob = nil
+			} else {
+				var ok bool
+				select {
+				case job, ok = <-p.jobsChan:
+					if !ok {
+						p.tokenManager.ReleaseToken(tok)
+						return
+					}
+				case <-p.ctx.Done():
+					p.tokenManager.ReleaseToken(tok)
+					return
+				}
 			}
-
-			atomic.AddUint64(&p.processed, 1)
 
 			accessToken, err := p.tokenManager.GetAccessToken(tok)
 			if err != nil {
 				tokenDead = true
 				p.tokenManager.MarkDeadAndRelease(tok)
 				log.Printf("[TOKEN] Exchange failed: %v — getting new token...", err)
-				p.safeRequeue(job)
+				retry := job
+				retryJob = &retry
 				break
 			}
 
 			// Wait for rate limit
 			if err := p.waitForRateLimit(); err != nil {
 				// Context cancelled
-				p.safeRequeue(job)
 				return
 			}
 
@@ -250,7 +268,8 @@ func (p *Pool) worker() {
 				total, alive, dead := p.tokenManager.Stats()
 				log.Printf("[TOKEN] Token dead (status %d)! Total: %d, Alive: %d, Dead: %d", statusCode, total, alive, dead)
 				// Re-queue email to be processed with new token
-				p.safeRequeue(job)
+				retry := job
+				retryJob = &retry
 				break
 			}
 
@@ -258,7 +277,7 @@ func (p *Pool) worker() {
 			if statusCode == 403 {
 				p.trackFailReason("status_403")
 				atomic.AddUint64(&p.failed, 1)
-				p.markDone(job)
+				p.markTerminal(job)
 				time.Sleep(500 * time.Millisecond) // Backoff khi bị rate limit
 				continue
 			}
@@ -266,17 +285,18 @@ func (p *Pool) worker() {
 			// Handle 500 - token quota exhausted: mark exhausted + rotate token.
 			// Sau threshold fail liên tiếp, token được gửi vào deadChan để delete user.
 			if statusCode == 500 {
-				p.trackFailReason("status_500")
-				atomic.AddUint64(&p.failed, 1)
 				if p.tokenManager.MarkQuotaExhausted(tok) {
 					tokenDead = true
 					_, alive, _, exhausted := p.tokenManager.FullStats()
 					log.Printf("[TOKEN] Token exhausted (consecutive 500s)! Alive: %d, Exhausted: %d", alive, exhausted)
-					p.safeRequeue(job)
+					retry := job
+					retryJob = &retry
 					break
 				}
 				// Below threshold: email consumed a request with this token; mark terminal.
-				p.markDone(job)
+				p.trackFailReason("status_500")
+				atomic.AddUint64(&p.failed, 1)
+				p.markTerminal(job)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -285,7 +305,7 @@ func (p *Pool) worker() {
 			if statusCode >= 500 {
 				p.trackFailReason(fmt.Sprintf("status_%d", statusCode))
 				atomic.AddUint64(&p.failed, 1)
-				p.markDone(job)
+				p.markTerminal(job)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -302,7 +322,7 @@ func (p *Pool) worker() {
 						log.Printf("[WRITER] Failed to write result: %v", writeErr)
 					}
 				}
-				p.markDone(job)
+				p.markTerminal(job)
 				continue
 			}
 
@@ -313,7 +333,7 @@ func (p *Pool) worker() {
 				p.trackFailReason("connection_error")
 			}
 			atomic.AddUint64(&p.failed, 1)
-			p.markDone(job)
+			p.markTerminal(job)
 		}
 
 		// Token was dead or jobsChan closed, return token if still alive

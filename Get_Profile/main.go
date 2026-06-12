@@ -23,6 +23,12 @@ import (
 	"time"
 )
 
+const (
+	tokenFetchBatchSize        = 300
+	tokenQueueBaseCapacity     = 2000
+	tokenQueueBaseLowWatermark = 100
+)
+
 func main() {
 	startTimestamp := time.Now().Format("2006-01-02_15-04-05")
 
@@ -126,17 +132,22 @@ func main() {
 	}
 
 	// Initialize token manager with empty queue
+	tokenQueueCapacity, tokenLowWatermark, tokenHighWatermark, initialTokenTarget := tokenQueueSettings(cfg.NumWorkers)
 	tokenManager := token.NewManagerWithProxy(cfg.Proxy)
-	tokenManager.InitEmptyQueue(2000)
-	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
+	tokenManager.InitEmptyQueue(tokenQueueCapacity)
+	log.Printf("[TOKEN] Queue mode enabled (capacity=%d, low=%d, high=%d, initial=%d)",
+		tokenQueueCapacity, tokenLowWatermark, tokenHighWatermark, initialTokenTarget)
 
-	// Pre-fetch initial batch of tokens (1 API call for 300 tokens — khớp MIN_QUEUE_SIZE)
+	// Pre-fetch enough tokens for the configured worker count.
 	log.Println("[TOKEN] Fetching initial tokens from API...")
 	var fetched int
-	for fetched == 0 {
-		tokens, err := apiClient.FetchTokens(300)
+	for tokenManager.QueueLen() < initialTokenTarget {
+		tokens, err := apiClient.FetchTokens(tokenFetchBatchSize)
 		if err != nil {
-			log.Printf("[TOKEN] Pre-fetch error: %v", err)
+			if fetched == 0 {
+				log.Fatalf("[ERROR] Failed to pre-fetch tokens from API: %v", err)
+			}
+			log.Printf("[TOKEN] Pre-fetch stopped after %d tokens: %v", fetched, err)
 			break
 		}
 		if tokens == nil {
@@ -147,7 +158,7 @@ func main() {
 		for _, t := range tokens {
 			tokenManager.AddToken(t)
 		}
-		fetched = len(tokens)
+		fetched += len(tokens)
 	}
 	if fetched == 0 {
 		log.Fatalf("[ERROR] Failed to pre-fetch any tokens from API")
@@ -159,7 +170,10 @@ func main() {
 	tokenManager.SetDeadChan(deadChan)
 
 	// Bridge: deadChan → apiClient.QueueDelete
+	var bridgeWg sync.WaitGroup
+	bridgeWg.Add(1)
 	go func() {
+		defer bridgeWg.Done()
 		for email := range deadChan {
 			apiClient.QueueDelete(email)
 		}
@@ -182,21 +196,36 @@ func main() {
 			default:
 			}
 
-			if tokenManager.QueueLen() < 100 {
-				tokens, err := apiClient.FetchTokens(300)
-				if err != nil {
-					log.Printf("[TOKEN] Background fetch error: %v", err)
-					time.Sleep(2 * time.Second)
-					continue
+			if tokenManager.QueueLen() < tokenLowWatermark {
+				fetched := 0
+				for tokenManager.QueueLen() < tokenHighWatermark {
+					select {
+					case <-fetchCtx.Done():
+						return
+					default:
+					}
+
+					tokens, err := apiClient.FetchTokens(tokenFetchBatchSize)
+					if err != nil {
+						log.Printf("[TOKEN] Background fetch error: %v", err)
+						time.Sleep(2 * time.Second)
+						break
+					}
+					if tokens == nil {
+						time.Sleep(2 * time.Second)
+						break
+					}
+					for _, t := range tokens {
+						tokenManager.AddToken(t)
+					}
+					fetched += len(tokens)
+					if len(tokens) < tokenFetchBatchSize {
+						break
+					}
 				}
-				if tokens == nil {
-					time.Sleep(2 * time.Second)
-					continue
+				if fetched > 0 {
+					log.Printf("[TOKEN] Background fetched %d tokens, queue: %d", fetched, tokenManager.QueueLen())
 				}
-				for _, t := range tokens {
-					tokenManager.AddToken(t)
-				}
-				log.Printf("[TOKEN] Background fetched %d tokens, queue: %d", len(tokens), tokenManager.QueueLen())
 			} else {
 				time.Sleep(1 * time.Second)
 			}
@@ -251,6 +280,7 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("\n[SHUTDOWN] Received interrupt signal, shutting down...")
+		fetchCancel()
 		pool.Shutdown()
 		closeDone()
 	}()
@@ -261,6 +291,7 @@ func main() {
 	// Shutdown cleanup
 	fetchCancel()
 	close(deadChan)
+	bridgeWg.Wait()
 	apiClient.CloseDeleteChan()
 	deleteCancel()
 	deleteWg.Wait()
@@ -312,4 +343,26 @@ func repeatString(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+func tokenQueueSettings(workers int) (capacity, lowWatermark, highWatermark, initialTarget int) {
+	capacity = maxInt(tokenQueueBaseCapacity, workers*4)
+	lowWatermark = maxInt(tokenQueueBaseLowWatermark, workers)
+	highWatermark = minInt(capacity, maxInt(lowWatermark+tokenFetchBatchSize, workers*2))
+	initialTarget = minInt(highWatermark, maxInt(tokenFetchBatchSize, workers))
+	return
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

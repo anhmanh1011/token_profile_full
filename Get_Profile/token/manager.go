@@ -1,6 +1,7 @@
 package token
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"linkedin_fetcher/proxy"
@@ -52,8 +53,11 @@ type Manager struct {
 	exchangeClient *http.Client
 
 	// Token queue — workers acquire/release here.
-	tokenQueue chan *TokenInfo
-	queueMode  bool
+	tokenQueue     chan *TokenInfo
+	queueMode      bool
+	queueMu        sync.RWMutex
+	queueClosed    int32
+	closeQueueOnce sync.Once
 
 	// Statistics
 	totalTokens    int32
@@ -105,11 +109,10 @@ func (m *Manager) SetDeadChan(ch chan<- string) {
 func (m *Manager) AddToken(t *TokenInfo) {
 	m.tokenInfos = append(m.tokenInfos, t)
 	atomic.AddInt32(&m.totalTokens, 1)
-	if m.queueMode && m.tokenQueue != nil {
-		select {
-		case m.tokenQueue <- t:
-		default:
-		}
+	if m.queueMode && !m.enqueueToken(t) {
+		slog.Warn("token/manager: token queue unavailable or full; token was not queued",
+			"user", t.Username,
+		)
 	}
 }
 
@@ -129,12 +132,7 @@ func (m *Manager) MarkQuotaExhausted(token *TokenInfo) bool {
 	}
 	token.exhaustedAt = time.Now()
 	atomic.AddInt32(&m.exhaustedCount, 1)
-	if m.deadChan != nil && token.Username != "" {
-		select {
-		case m.deadChan <- token.Username:
-		default:
-		}
-	}
+	m.notifyDead(token.Username)
 	return true
 }
 
@@ -150,7 +148,8 @@ func (m *Manager) ResetFailCount(token *TokenInfo) {
 func (m *Manager) Stats() (total, alive, dead int) {
 	total = int(atomic.LoadInt32(&m.totalTokens))
 	dead = int(atomic.LoadInt32(&m.deadCount))
-	alive = total - dead
+	exhausted := int(atomic.LoadInt32(&m.exhaustedCount))
+	alive = total - dead - exhausted
 	return
 }
 
@@ -174,18 +173,36 @@ func (m *Manager) HasAliveTokens() bool {
 // InitEmptyQueue initializes queue mode with an empty queue.
 // Tokens are added later via AddToken().
 func (m *Manager) InitEmptyQueue(bufferSize int) {
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+
 	m.tokenQueue = make(chan *TokenInfo, bufferSize)
 	m.queueMode = true
+	atomic.StoreInt32(&m.queueClosed, 0)
+	m.closeQueueOnce = sync.Once{}
 }
 
-// AcquireToken gets a token from queue (blocks until available or closed).
-// Returns nil if queue is closed.
-func (m *Manager) AcquireToken() *TokenInfo {
-	token, ok := <-m.tokenQueue
-	if !ok {
+// AcquireToken gets a token from queue. It returns nil when ctx is cancelled or
+// the queue has been closed.
+func (m *Manager) AcquireToken(ctx context.Context) *TokenInfo {
+	m.queueMu.RLock()
+	ch := m.tokenQueue
+	closed := atomic.LoadInt32(&m.queueClosed) == 1
+	m.queueMu.RUnlock()
+
+	if ch == nil || closed {
 		return nil
 	}
-	return token
+
+	select {
+	case token, ok := <-ch:
+		if !ok {
+			return nil
+		}
+		return token
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 // ReleaseToken returns a token to the queue for reuse.
@@ -193,10 +210,11 @@ func (m *Manager) ReleaseToken(token *TokenInfo) {
 	if token == nil {
 		return
 	}
-	if atomic.LoadInt32(&token.dead) == 0 {
-		select {
-		case m.tokenQueue <- token:
-		default:
+	if atomic.LoadInt32(&token.dead) == 0 && atomic.LoadInt32(&token.exhausted) == 0 {
+		if !m.enqueueToken(token) {
+			slog.Warn("token/manager: could not return token to queue",
+				"user", token.Username,
+			)
 		}
 	}
 }
@@ -209,12 +227,7 @@ func (m *Manager) MarkDeadAndRelease(token *TokenInfo) {
 	}
 	if atomic.CompareAndSwapInt32(&token.dead, 0, 1) {
 		atomic.AddInt32(&m.deadCount, 1)
-		if m.deadChan != nil && token.Username != "" {
-			select {
-			case m.deadChan <- token.Username:
-			default:
-			}
-		}
+		m.notifyDead(token.Username)
 	}
 }
 
@@ -258,6 +271,9 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 
 // QueueLen returns current queue length.
 func (m *Manager) QueueLen() int {
+	m.queueMu.RLock()
+	defer m.queueMu.RUnlock()
+
 	if m.tokenQueue == nil {
 		return 0
 	}
@@ -266,7 +282,40 @@ func (m *Manager) QueueLen() int {
 
 // CloseQueue closes the token queue (signals workers to stop).
 func (m *Manager) CloseQueue() {
-	if m.tokenQueue != nil {
-		close(m.tokenQueue)
+	m.closeQueueOnce.Do(func() {
+		m.queueMu.Lock()
+		defer m.queueMu.Unlock()
+
+		atomic.StoreInt32(&m.queueClosed, 1)
+		if m.tokenQueue != nil {
+			close(m.tokenQueue)
+		}
+	})
+}
+
+func (m *Manager) enqueueToken(token *TokenInfo) bool {
+	if token == nil || !m.queueMode {
+		return false
 	}
+
+	m.queueMu.RLock()
+	defer m.queueMu.RUnlock()
+
+	if m.tokenQueue == nil || atomic.LoadInt32(&m.queueClosed) == 1 {
+		return false
+	}
+
+	select {
+	case m.tokenQueue <- token:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) notifyDead(username string) {
+	if m.deadChan == nil || username == "" {
+		return
+	}
+	m.deadChan <- username
 }

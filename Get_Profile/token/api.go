@@ -8,14 +8,18 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	apiBatchDeleteSize = 20
-	apiFlushInterval   = 5 * time.Second
+	apiBatchDeleteSize      = 20
+	apiFlushInterval        = 5 * time.Second
+	apiDeleteMaxAttempts    = 5
+	apiDeleteRetryBaseDelay = 200 * time.Millisecond
+	apiDeleteFlushTimeout   = 30 * time.Second
 )
 
 // APIClient is an HTTP client for the Python token-management API service.
@@ -141,14 +145,13 @@ func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
 	return nil, lastErr
 }
 
-// QueueDelete enqueues email for batch deletion. The send is non-blocking;
-// if the channel is full the email is dropped and a warning is logged.
+// QueueDelete enqueues email for batch deletion. It blocks instead of dropping
+// cleanup work when the delete worker is briefly behind.
 func (c *APIClient) QueueDelete(email string) {
-	select {
-	case c.deleteChan <- email:
-	default:
-		slog.Warn("token/api: delete channel full, dropping email", "email", email)
+	if strings.TrimSpace(email) == "" {
+		return
 	}
+	c.deleteChan <- email
 }
 
 // StartDeleteWorker launches a background goroutine that drains deleteChan,
@@ -169,7 +172,16 @@ func (c *APIClient) StartDeleteWorker(ctx context.Context, wg *sync.WaitGroup) {
 			if len(batch) == 0 {
 				return
 			}
-			c.sendDeleteBatch(batch)
+			emails := append([]string(nil), batch...)
+			sendCtx, cancel := context.WithTimeout(context.Background(), apiDeleteFlushTimeout)
+			if err := c.sendDeleteBatch(sendCtx, emails); err != nil {
+				slog.Error("token/api: delete batch failed after retries",
+					"count", len(emails),
+					"emails", joinQuoted(emails),
+					"err", err,
+				)
+			}
+			cancel()
 			batch = batch[:0]
 		}
 
@@ -219,41 +231,85 @@ func (c *APIClient) CloseDeleteChan() {
 }
 
 // sendDeleteBatch posts a batch of email addresses to POST {baseURL}/users/delete.
-// Errors are logged; the function is best-effort and does not return an error.
-func (c *APIClient) sendDeleteBatch(emails []string) {
+// Transient API errors are retried with backoff; permanent failures are
+// returned to the caller for logging or dead-letter handling.
+func (c *APIClient) sendDeleteBatch(ctx context.Context, emails []string) error {
+	if len(emails) == 0 {
+		return nil
+	}
+
 	payload, err := json.Marshal(deleteRequest{Emails: emails})
 	if err != nil {
-		slog.Error("token/api: failed to marshal delete request",
-			"count", len(emails),
-			"err", err,
-		)
-		return
+		return fmt.Errorf("marshal delete request: %w", err)
 	}
 
 	url := c.baseURL + "/users/delete"
-	resp, err := c.httpClient.Post(url, "application/json", bytes.NewReader(payload)) //nolint:noctx // best-effort background flush
-	if err != nil {
-		slog.Error("token/api: failed to send delete batch",
+	var lastErr error
+	for attempt := 1; attempt <= apiDeleteMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			return fmt.Errorf("create delete request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("send delete batch attempt %d: %w", attempt, err)
+		} else {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode < http.StatusBadRequest {
+				slog.Info("token/api: delete batch sent", "count", len(emails), "attempt", attempt)
+				return nil
+			}
+
+			lastErr = fmt.Errorf("delete batch status %d", resp.StatusCode)
+			if !shouldRetryDeleteStatus(resp.StatusCode) {
+				return lastErr
+			}
+		}
+
+		if attempt == apiDeleteMaxAttempts {
+			break
+		}
+
+		delay := deleteRetryDelay(resp, attempt)
+		slog.Warn("token/api: delete batch failed, retrying",
+			"attempt", attempt,
+			"delay", delay,
 			"count", len(emails),
-			"emails", joinQuoted(emails),
-			"err", err,
+			"err", lastErr,
 		)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Drain body to allow connection reuse.
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		slog.Error("token/api: delete batch returned error status",
-			"status", resp.StatusCode,
-			"count", len(emails),
-		)
-		return
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	slog.Info("token/api: delete batch sent", "count", len(emails))
+	return lastErr
+}
+
+func shouldRetryDeleteStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func deleteRetryDelay(resp *http.Response, attempt int) time.Duration {
+	if resp != nil {
+		if header := resp.Header.Get("Retry-After"); header != "" {
+			if seconds, err := strconv.Atoi(header); err == nil && seconds >= 0 {
+				return time.Duration(seconds) * time.Second
+			}
+			if retryAt, err := http.ParseTime(header); err == nil {
+				if delay := time.Until(retryAt); delay > 0 {
+					return delay
+				}
+				return 0
+			}
+		}
+	}
+	return time.Duration(attempt) * apiDeleteRetryBaseDelay
 }
 
 // joinQuoted returns the strings joined as `"a","b","c"` for log output.

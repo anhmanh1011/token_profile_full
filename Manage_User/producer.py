@@ -16,7 +16,8 @@ from token_getter import BulkTokenGetter
 
 logger = logging.getLogger(__name__)
 
-MIN_QUEUE_SIZE = 100
+MIN_QUEUE_SIZE = 400
+TARGET_QUEUE_SIZE = 800
 BATCH_SIZE = 100
 POLL_INTERVAL = 30  # seconds to sleep when queue is full
 
@@ -42,7 +43,12 @@ class TokenProducer:
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True, name="producer")
         self.thread.start()
-        logger.info("Producer started (min queue: %d, batch: %d)", MIN_QUEUE_SIZE, BATCH_SIZE)
+        logger.info(
+            "Producer started (low queue: %d, target queue: %d, batch: %d)",
+            MIN_QUEUE_SIZE,
+            TARGET_QUEUE_SIZE,
+            BATCH_SIZE,
+        )
 
     def stop(self) -> None:
         """Signal producer to stop."""
@@ -71,7 +77,10 @@ class TokenProducer:
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                need = min(MIN_QUEUE_SIZE - current_size, BATCH_SIZE)
+                need = min(TARGET_QUEUE_SIZE - current_size, BATCH_SIZE)
+                if need <= 0:
+                    time.sleep(POLL_INTERVAL)
+                    continue
                 logger.info("Queue has %d tokens, producing %d more", current_size, need)
                 self._produce_batch(need)
 
