@@ -12,7 +12,8 @@ token producer, token queue, cleanup flow, and delete flow.
 
 The first implementation should optimize for operational safety and low risk:
 one `Manage_User` service can host many pools, while each `Get_Profile` process
-is bound to exactly one pool and one email shard.
+is independent and bound to exactly one pool, one email shard, one result file,
+and one bitmap checkpoint file.
 
 ## Current Constraints
 
@@ -29,7 +30,10 @@ is bound to exactly one pool and one email shard.
 
 ## Recommended Architecture
 
-Introduce a `pool_id` as the primary routing key.
+Introduce a resolved `pool_id` as the primary routing key. The current
+`admin_token_config_global.json` does not need to contain `pool_id` immediately;
+the loader can derive it from `bot_prefix` and later accept an explicit
+`pool_id`/`instance_id` field.
 
 Each pool owns:
 
@@ -44,54 +48,87 @@ Each pool owns:
 Recommended data flow:
 
 ```text
-admin_token.json
+admin_token_config_global.json
   -> PoolRegistry
-      -> PoolState(pool_01): AdminTokenManager + TokenProducer + queue + proxy
-      -> PoolState(pool_02): AdminTokenManager + TokenProducer + queue + proxy
+      -> PoolState(bot_p01): AdminTokenManager + TokenProducer + queue + proxy
+      -> PoolState(bot_p02): AdminTokenManager + TokenProducer + queue + proxy
 
-Get_Profile --pool pool_01
-  -> GET  /pools/pool_01/tokens/next?count=300
-  -> GET  /pools/pool_01/proxy
-  -> POST /pools/pool_01/users/delete
+Get_Profile instance 1
+  --pool bot_p01
+  --emails email1.txt
+  --checkpoint email1.txt.bot_p01.ckpt
+  -> GET  /pools/bot_p01/tokens/next?count=300
+  -> GET  /pools/bot_p01/proxy
+  -> POST /pools/bot_p01/users/delete
+
+Get_Profile instance 2
+  --pool bot_p02
+  --emails email2.txt
+  --checkpoint email2.txt.bot_p02.ckpt
+  -> same API shape, scoped to bot_p02
 ```
 
 ## Configuration Shape
 
-Replace "first admin wins" behavior with explicit pool records:
+Use `admin_token_config_global.json` as the source of truth. The observed shape
+is already close to the target: one array item per admin/pool/Get_Profile
+instance.
 
 ```json
 [
   {
-    "pool_id": "pool_01",
-    "enabled": true,
-    "domain": "example-a.com",
-    "tenant_id": "tenant-a",
     "refresh_token": "...",
-    "proxy": "socks5h://user:pass@host:port",
-    "bot_prefix": "bot_p01_",
-    "queue": {
-      "low_watermark": 400,
-      "target_size": 800,
-      "max_size": 1000,
-      "producer_batch_size": 100
-    }
+    "tenant_id": "tenant_id1",
+    "username": "username_admin1",
+    "domain": "domain1",
+    "proxy": "host:port[:user:pass]",
+    "email_file": "email1.txt",
+    "bot_prefix": "bot_p01_"
   },
   {
-    "pool_id": "pool_02",
-    "enabled": true,
-    "domain": "example-b.com",
-    "tenant_id": "tenant-b",
     "refresh_token": "...",
-    "proxy": "socks5h://user:pass@host2:port",
+    "tenant_id": "tenant_id2",
+    "username": "username_admin2",
+    "domain": "domain2",
+    "proxy": "host:port[:user:pass]",
+    "email_file": "email2.txt",
     "bot_prefix": "bot_p02_"
   }
 ]
 ```
 
+Optional fields for future convenience:
+
+```json
+{
+  "pool_id": "bot_p01",
+  "enabled": true,
+  "checkpoint_file": "email1.txt.bot_p01.ckpt",
+  "result_file": "result_bot_p01.txt",
+  "workers": 400,
+  "max_cpm": 20000,
+  "queue": {
+    "low_watermark": 400,
+    "target_size": 800,
+    "max_size": 1000,
+    "producer_batch_size": 100
+  }
+}
+```
+
 Validation rules:
 
-- `pool_id` must be unique, stable, and match `^[a-zA-Z0-9_-]{1,64}$`.
+- `pool_id`, when present, must be unique, stable, and match
+  `^[a-zA-Z0-9_-]{1,64}$`.
+- If `pool_id` is absent, derive it from `bot_prefix` by trimming trailing
+  underscores. Example: `bot_p01_` -> `bot_p01`.
 - `bot_prefix` must be unique within the same tenant.
+- `email_file` must be present and should be unique for independent
+  `Get_Profile` instances.
+- `checkpoint_file`, if present, must be unique. If absent, default to
+  `<email_file>.<pool_id>.ckpt`.
+- `result_file`, if present, must be unique. If absent, default to
+  `result_<pool_id>_<timestamp>.txt`.
 - `proxy` must normalize to `socks5h://...` or be empty.
 - `tenant_id`, `refresh_token`, and `domain` are required for enabled pools.
 - Queue defaults can be inherited when omitted.
@@ -214,41 +251,64 @@ Response shape for status:
 
 ## Get_Profile Design
 
-Phase 1 should keep `Get_Profile` single-pool:
+Phase 1 should keep each `Get_Profile` process single-pool. Running multiple
+instances means launching multiple OS processes, not one Go process internally
+sharing many pools.
 
 ```bash
 get_profile.exe \
   --api http://localhost:5000 \
-  --pool pool_01 \
-  --emails emails_pool_01.txt \
-  --result result_pool_01.txt \
-  --checkpoint emails_pool_01.ckpt
+  --pool bot_p01 \
+  --emails email1.txt \
+  --result result_bot_p01.txt \
+  --checkpoint email1.txt.bot_p01.ckpt
 ```
 
 Changes:
 
 - Add `--pool` flag.
+- Optionally add `--config admin_token_config_global.json --instance bot_p01`
+  as a convenience mode that resolves `--pool`, `--emails`, `--result`, and
+  `--checkpoint` from the config record.
 - API client calls `/pools/<pool_id>/tokens/next`.
 - Proxy resolution calls `/pools/<pool_id>/proxy`.
 - `TokenInfo` carries `PoolID`.
 - Dead token cleanup calls `/pools/<pool_id>/users/delete`.
-- Logs include pool ID.
+- Logs include pool ID and instance ID.
+- Each process owns its own `progress.Bitmap` and never writes another
+  instance's checkpoint.
 
 This keeps each Go process simple and avoids cross-pool proxy routing inside
 one worker pool.
 
+Recommended process mapping from the observed config:
+
+| Config field | Get_Profile usage |
+|---|---|
+| `bot_prefix` | Derive `pool_id` if no explicit `pool_id` exists |
+| `email_file` | `--emails` |
+| `checkpoint_file` optional | `--checkpoint`; otherwise `<email_file>.<pool_id>.ckpt` |
+| `result_file` optional | `--result`; otherwise timestamped `result_<pool_id>_*.txt` |
+| `proxy` | Exposed through `/pools/<pool_id>/proxy`, not passed directly in normal mode |
+| `tenant_id` | Returned with refresh tokens for token exchange |
+
 ## Email Sharding
 
 Do not run multiple `Get_Profile` processes against the same email file and
-checkpoint.
+checkpoint. The config should be treated as an instance plan: one enabled config
+record launches one independent `Get_Profile` process.
 
 Recommended phase 1 operation:
 
 ```text
-emails_pool_01.txt + emails_pool_01.ckpt -> Get_Profile --pool pool_01
-emails_pool_02.txt + emails_pool_02.ckpt -> Get_Profile --pool pool_02
-emails_pool_03.txt + emails_pool_03.ckpt -> Get_Profile --pool pool_03
+email1.txt + email1.txt.bot_p01.ckpt -> Get_Profile --pool bot_p01
+email2.txt + email2.txt.bot_p02.ckpt -> Get_Profile --pool bot_p02
+email3.txt + email3.txt.bot_p03.ckpt -> Get_Profile --pool bot_p03
 ```
+
+If two records intentionally use the same `email_file`, they must still use
+different `checkpoint_file` values. That can duplicate work and should be an
+explicit choice, not the default.
 
 Use a deterministic split command or script before launch. A future coordinator
 can own central job assignment, but that is a separate feature.
@@ -289,8 +349,12 @@ Merge or reapply the reliability branch first:
 ### Phase 4: Get_Profile Pool Flag
 
 - Add `--pool`.
+- Add optional config resolution mode:
+  `--config admin_token_config_global.json --instance <pool_id>`.
 - Update token API client to path-scoped endpoints.
 - Include pool ID in token/dead-delete paths.
+- Generate independent default checkpoint names:
+  `<email_file>.<pool_id>.ckpt`.
 - Add tests for API URL construction and delete payload routing.
 
 ### Phase 5: Multi-Instance Runner
@@ -298,9 +362,15 @@ Merge or reapply the reliability branch first:
 Optional helper script:
 
 ```text
-run_pool pool_01 emails_pool_01.txt 5000
-run_pool pool_02 emails_pool_02.txt 5000
-run_pool pool_03 emails_pool_03.txt 5000
+run_from_config admin_token_config_global.json
+```
+
+It should launch one process per enabled record:
+
+```text
+get_profile.exe --pool bot_p01 --emails email1.txt --checkpoint email1.txt.bot_p01.ckpt
+get_profile.exe --pool bot_p02 --emails email2.txt --checkpoint email2.txt.bot_p02.ckpt
+get_profile.exe --pool bot_p03 --emails email3.txt --checkpoint email3.txt.bot_p03.ckpt
 ```
 
 This can be PowerShell for Windows and shell/systemd templates for Linux.
@@ -321,7 +391,8 @@ This is not recommended for the first implementation.
 
 Python:
 
-- Config validation: duplicate `pool_id`, duplicate `bot_prefix` in same tenant,
+- Config validation: duplicate resolved `pool_id`, duplicate `bot_prefix` in
+  same tenant, missing `email_file`, duplicate default `checkpoint_file`,
   missing required fields, malformed proxy.
 - Registry routing: `/pools`, `/pools/<pool_id>/status`,
   `/pools/<pool_id>/tokens/next`.
@@ -332,6 +403,10 @@ Python:
 Go:
 
 - `--pool` flag required when multiple pools are configured.
+- `--config --instance` resolves `email_file`, default result file, and default
+  bitmap checkpoint from the selected config record.
+- Default checkpoint names include pool ID, so independent instances do not
+  collide.
 - Token fetch URL uses `/pools/<pool_id>/tokens/next`.
 - Proxy fetch URL uses `/pools/<pool_id>/proxy`.
 - Delete worker sends to `/pools/<pool_id>/users/delete`.
@@ -355,6 +430,8 @@ Integration:
   service on every pool.
 - **Config drift**: Validate pool config at startup and expose degraded pools in
   `/pools`.
+- **Bitmap collision**: Default checkpoint names include pool ID and validation
+  rejects duplicate explicit checkpoint paths.
 - **Operational overload**: Start with one Go process per pool and explicit email
   shards; avoid single-process multi-pool scheduling until needed.
 
