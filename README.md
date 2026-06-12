@@ -8,7 +8,7 @@ Hệ thống tự động quản lý user Microsoft 365 và thu thập LinkedIn 
 
 Long-running HTTP service quản lý lifecycle users:
 - **Startup cleanup**: Xóa toàn bộ `bot_` users từ lần chạy trước
-- **Background producer**: Tự động tạo users + lấy refresh tokens, giữ ≥100 tokens trong queue
+- **Background producer**: Tự động tạo users + lấy refresh tokens, giữ queue theo low watermark 400 và target 800
 - **API endpoints**: Serve tokens cho Go app, nhận yêu cầu xóa users
 
 ### [Get_Profile](Get_Profile/) (Go) — Batch Job
@@ -61,7 +61,7 @@ admin_token.json (refresh_token + tenant_id + proxy)
 | Method | Path | Response | Mô tả |
 |--------|------|----------|-------|
 | `GET` | `/tokens/next?count=N` | `{"tokens": [...], "count": N}` hoặc 202 | Lấy batch tokens (default 100, max 500) |
-| `POST` | `/users/delete` | `{"deleted": N, "failed": N}` | Batch delete users |
+| `POST` | `/users/delete` | `{"deleted": N, "failed": N}` | Batch delete users, tối đa 20 emails/request, validate email format |
 | `GET` | `/proxy` | `{"proxy": "socks5h://..."}` hoặc `{"proxy": null}` | SOCKS5 URL bound to current admin |
 | `GET` | `/status` | `{"queue_size", "total_created", ...}` | Monitoring |
 
@@ -108,6 +108,15 @@ go build -o get_profile.exe .
 3. Nếu Python service down hoặc không có proxy → fallback direct dial (cảnh báo IP thật).
 
 Đổi proxy: sửa field `proxy` trong `Manage_User/admin_token.json` rồi **restart Get_Profile** (Python service tự reload).
+
+### Reliability behavior
+
+- `Manage_User` producer starts accepting requests after the queue reaches 400 tokens and keeps refilling toward 800 tokens.
+- `Get_Profile` pre-fetches enough tokens for the configured worker count, then refills when the token queue falls below `max(100, workers)`.
+- Worker retries caused by token exchange failure, 401/424, or token quota exhaustion do not mark checkpoint bits and do not increment `processed`; the same email is retried with the next token.
+- Terminal outcomes set the bitmap checkpoint exactly once: success, 403, below-threshold 500, other 5xx, and non-token errors.
+- Dead/exhausted token cleanup is batched in groups of 20 and retried up to 5 attempts with backoff before logging a final failure.
+- Shutdown cancels the token fetcher before closing queues and drains dead-token cleanup before exiting.
 
 ### Manage_User flags
 
