@@ -1,12 +1,14 @@
 import unittest
+import queue
 
 import app as service_app
+from pool_config import PoolConfig
 
 
 class DeleteUsersValidationTest(unittest.TestCase):
     def setUp(self) -> None:
         service_app.app.config["TESTING"] = True
-        service_app._token_mgr = None
+        service_app._pools.clear()
         self.client = service_app.app.test_client()
 
     def test_delete_requires_json_email_list(self) -> None:
@@ -37,6 +39,31 @@ class DeleteUsersValidationTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertIn("not initialised", response.get_json()["error"])
+
+    def test_delete_rejects_email_outside_pool_scope(self) -> None:
+        pool_config = PoolConfig(
+            pool_id="bot_p01",
+            refresh_token="redacted",
+            tenant_id="tenant",
+            username="admin",
+            domain="example.com",
+            proxy=None,
+            email_file="email1.txt",
+            bot_prefix="bot_p01_",
+        )
+        service_app._pools["bot_p01"] = service_app.PoolState(
+            config=pool_config,
+            token_mgr=None,
+            token_queue=queue.Queue(),
+        )
+
+        response = self.client.post(
+            "/pools/bot_p01/users/delete",
+            json={"emails": ["bot_p02_abcd@example.com"]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not match pool prefix", response.get_json()["error"])
 
 
 if __name__ == "__main__":

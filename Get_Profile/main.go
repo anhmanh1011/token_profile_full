@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,16 +37,58 @@ func main() {
 	emailsFile := flag.String("emails", "", "Path to emails file (default: emails.txt)")
 	resultFile := flag.String("result", "", "Path to result file (will use timestamp if not specified)")
 	apiAddr := flag.String("api", "", "Python API service address (default: http://localhost:5000)")
+	globalConfig := flag.String("config", "", "Path to admin_token_config_global.json")
+	poolName := flag.String("pool", "", "Pool ID from admin_token_config_global.json")
+	instanceName := flag.String("instance", "", "Alias for --pool")
 	numWorkers := flag.Int("workers", 400, "Number of workers")
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
-	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.ckpt)")
+	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.<pool>.ckpt)")
 	proxyOverride := flag.String("proxy", "", "SOCKS5 proxy override; empty = fetch from Python /proxy endpoint")
 	flag.Parse()
 
+	configPath := strings.TrimSpace(*globalConfig)
+	if configPath == "" {
+		var err error
+		configPath, err = config.DefaultGlobalConfigPath()
+		if err != nil {
+			fmt.Printf("[ERROR] %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	requestedPool := strings.TrimSpace(*poolName)
+	requestedInstance := strings.TrimSpace(*instanceName)
+	if requestedPool != "" && requestedInstance != "" && requestedPool != requestedInstance {
+		fmt.Println("[ERROR] --pool and --instance refer to different values")
+		os.Exit(1)
+	}
+	if requestedPool == "" {
+		requestedPool = requestedInstance
+	}
+
+	globalInstances, err := config.LoadGlobalInstances(configPath)
+	if err != nil {
+		fmt.Printf("[ERROR] %v\n", err)
+		os.Exit(1)
+	}
+	selectedInstance, err := config.SelectGlobalInstance(globalInstances, requestedPool)
+	if err != nil {
+		fmt.Printf("[ERROR] %v\n", err)
+		os.Exit(1)
+	}
+	poolID := selectedInstance.ResolvedPoolID()
+	runID := strings.TrimSpace(*instanceID)
+	if runID == "" {
+		runID = poolID
+	}
+
 	// Generate timestamped filenames
-	logFileName := fmt.Sprintf("output_%s.log", startTimestamp)
-	resultFileName := fmt.Sprintf("result_%s.txt", startTimestamp)
+	logFileName := fmt.Sprintf("output_%s_%s.log", poolID, startTimestamp)
+	resultFileName := config.DefaultResultPath(poolID, startTimestamp)
+	if selectedInstance.ResultFile != "" {
+		resultFileName = selectedInstance.ResultFile
+	}
 	if *resultFile != "" {
 		resultFileName = *resultFile
 	}
@@ -61,33 +104,47 @@ func main() {
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	if *instanceID != "" {
-		log.SetPrefix(fmt.Sprintf("[%s] ", *instanceID))
-	}
+	log.SetPrefix(fmt.Sprintf("[%s] ", runID))
 	log.Println("=== LinkedIn Profile Fetcher ===")
 	log.Printf("Run timestamp: %s", startTimestamp)
 	log.Printf("Log file: %s", logFileName)
 	log.Printf("Result file: %s", resultFileName)
+	log.Printf("Global config: %s", configPath)
+	log.Printf("Pool: %s | Domain: %s | EmailFile: %s | BotPrefix: %s",
+		poolID, selectedInstance.Domain, selectedInstance.EmailFile, selectedInstance.BotPrefix)
 	log.Println("Starting application...")
 
 	// Load configuration
 	cfg := config.NewConfig()
 	cfg.NumWorkers = *numWorkers
 	cfg.MaxCPM = 20000 // Hard limit: 20K CPM
+	if selectedInstance.EmailFile != "" {
+		cfg.EmailsFile = selectedInstance.EmailFile
+	}
 	if *apiAddr != "" {
 		cfg.APIAddr = *apiAddr
 	}
 	if *emailsFile != "" {
 		cfg.EmailsFile = *emailsFile
 	}
+	if selectedInstance.Workers > 0 && !flagWasSet("workers") {
+		cfg.NumWorkers = selectedInstance.Workers
+	}
 	cfg.ResultsFile = resultFileName
+	if selectedInstance.MaxCPM > 0 && !flagWasSet("max-cpm") {
+		cfg.MaxCPM = selectedInstance.MaxCPM
+	}
 	if *maxCPM > 0 {
 		cfg.MaxCPM = *maxCPM
 	}
 
 	ckptPath := *checkpointFile
 	if ckptPath == "" {
-		ckptPath = cfg.EmailsFile + ".ckpt"
+		if selectedInstance.CheckpointFile != "" {
+			ckptPath = selectedInstance.CheckpointFile
+		} else {
+			ckptPath = config.DefaultCheckpointPath(cfg.EmailsFile, poolID)
+		}
 	}
 
 	log.Printf("[CONFIG] Workers: %d | APITimeout: %ds | EmailBuffer: %d | MaxCPM: %d",
@@ -113,14 +170,20 @@ func main() {
 	// Create API client for token fetching and user deletion (always direct,
 	// since the Python service is on localhost — must NOT go through SOCKS5).
 	apiClient := token.NewAPIClient(cfg.APIAddr)
-	log.Printf("[API] Token API client initialized: %s", cfg.APIAddr)
+	apiClient.SetPoolID(poolID)
+	log.Printf("[API] Token API client initialized: %s (pool=%s)", cfg.APIAddr, poolID)
 
 	// Resolve SOCKS5 proxy: --proxy flag overrides; otherwise ask the Python
-	// service which proxy is bound to the current admin in admin_token.json.
+	// service which proxy is bound to the selected global config pool.
 	cfg.Proxy = *proxyOverride
 	if cfg.Proxy == "" {
 		if p, err := apiClient.FetchProxy(); err != nil {
-			log.Printf("[PROXY] Failed to fetch /proxy from Python service: %v (continuing direct)", err)
+			if selectedInstance.Proxy != "" {
+				cfg.Proxy = selectedInstance.Proxy
+				log.Printf("[PROXY] Failed to fetch pool proxy from Python service: %v (using global config proxy)", err)
+			} else {
+				log.Printf("[PROXY] Failed to fetch pool proxy from Python service: %v (continuing direct)", err)
+			}
 		} else {
 			cfg.Proxy = p
 		}
@@ -351,6 +414,16 @@ func tokenQueueSettings(workers int) (capacity, lowWatermark, highWatermark, ini
 	highWatermark = minInt(capacity, maxInt(lowWatermark+tokenFetchBatchSize, workers*2))
 	initialTarget = minInt(highWatermark, maxInt(tokenFetchBatchSize, workers))
 	return
+}
+
+func flagWasSet(name string) bool {
+	wasSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			wasSet = true
+		}
+	})
+	return wasSet
 }
 
 func maxInt(a, b int) int {

@@ -1,132 +1,145 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance for coding agents working in this repository.
 
 ## Commands
 
 ```bash
 # Manage_User: start API service
 cd Manage_User && pip install -r requirements.txt
-cd Manage_User && python app.py --port 5000
+cd Manage_User && python app.py --port 5000 --config ../admin_token_config_global.json
 
-# Get_Profile: build & run
+# Get_Profile: build and run one pool
 cd Get_Profile && go build -o get_profile.exe .
-cd Get_Profile && ./get_profile.exe --api http://localhost:5000
+cd Get_Profile && ./get_profile.exe --api http://localhost:5000 --pool bot_p01
 
-# Syntax check Python modules
-cd Manage_User && python -m py_compile app.py && python -m py_compile cleanup.py && python -m py_compile producer.py && python -m py_compile creator.py && python -m py_compile deleter.py && python -m py_compile token_getter.py
+# Python checks
+cd Manage_User && python -m unittest discover -s . -p "test_*.py"
+cd Manage_User && python -m py_compile app.py admin_token_manager.py pool_config.py cleanup.py producer.py creator.py deleter.py token_getter.py proxy_config.py
 
-# Build & vet Go modules
-cd Get_Profile && go build . && go vet ./...
+# Go checks
+cd Get_Profile && go test ./...
+cd Get_Profile && go vet ./...
+cd Get_Profile && go build .
 
-# email-gen: build, test, bench (Rust)
+# email-gen
 cd email-gen && cargo build --release
 cd email-gen && cargo test --release
 cd email-gen && cargo clippy --release -- -D warnings
 cd email-gen && cargo bench
 ```
 
-Note: On the developer's Windows machine, use `py` instead of `python`.
+On the developer's Windows machine, use `py` instead of `python`.
 
 ## Architecture
 
-Three independent apps on the same VPS:
-- **Manage_User** (Python) — long-running HTTP API service tạo users và phát access tokens.
-- **Get_Profile** (Go) — batch job fetch LinkedIn profiles, consume tokens qua HTTP.
-- **email-gen** (Rust) — CLI utility standalone sinh `emails.txt` (input cho Get_Profile) bằng cross-product domains × usernames.
+Three independent apps run on the same VPS:
+- `Manage_User` (Python): long-running HTTP API service.
+- `Get_Profile` (Go): batch job fetches LinkedIn profiles and consumes tokens over HTTP.
+- `email-gen` (Rust): standalone CLI that generates email input files.
 
-**No Redis required.** Manage_User ↔ Get_Profile giao tiếp qua HTTP localhost. email-gen độc lập, user chạy tay sinh file.
+`Manage_User` and `Get_Profile` read only `admin_token_config_global.json` from the project root. Do not reintroduce `Manage_User/admin_token.json`.
 
-```
-admin_token.json (refresh_token + tenant_id + proxy)
-       │
-       ▼
-  [Manage_User API Service]  (Python, localhost:5000)
-  StartupCleaner → TokenProducer (background thread)
-  Admin OAuth + token_getter → SOCKS5 (socks5h://, DNS qua proxy)
-       │
-       ├── GET  /tokens/next    → refresh_token (Go tự exchange sang access_token)
-       ├── POST /users/delete   → batch delete users
-       ├── GET  /proxy          → expose SOCKS5 URL cho Go startup
-       └── GET  /status         → monitoring
-       │
-       ▼
-  [Get_Profile]  (Go, batch job)
-  APIClient → TokenManager → WorkerPool(400) → Loki API → result.txt
-  Loki + token-exchange clients → SOCKS5 (qua x/net/proxy);
-  /tokens/next & /users/delete → direct (localhost)
-       │
-       └── POST /users/delete (batch 20, dead token cleanup)
+```text
+admin_token_config_global.json
+       |
+       v
+Manage_User API Service (localhost:5000)
+  one pool per enabled config entry
+  per pool: AdminTokenManager, StartupCleaner, TokenProducer, Queue, delete stats
+       |
+       | GET  /pools/<pool_id>/tokens/next
+       | POST /pools/<pool_id>/users/delete
+       | GET  /pools/<pool_id>/proxy
+       v
+Get_Profile --pool <pool_id>
+  APIClient scopes localhost calls to /pools/<pool_id>/...
+  Loki + refresh-token exchange use the pool SOCKS5 proxy
+  checkpoint defaults to <email_file>.<pool_id>.ckpt
 ```
 
-### Manage_User module contracts
+## Global Config Shape
 
-| Module | Class | Input | Output |
-|--------|-------|-------|--------|
-| `admin_token_manager.py` | `AdminTokenManager` | admin dict | Shared OAuth token manager (thread-safe, auto-refresh, rotation tracking) |
-| `cleanup.py` | `StartupCleaner` | `AdminTokenManager` | `{found, deleted, failed, purged}` — soft-delete + permanently purge `bot_` users |
-| `creator.py` | `BulkUserCreator` | `AdminTokenManager`, count | `{created_users: [{email, password}], failed, licensed}` |
-| `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, refresh_token, tenant_id}], failed}` |
-| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps token queue above low watermark 400 and refills toward target 800; passes admin proxy to BulkTokenGetter; backfills missing tenant_id with admin tenant |
-| `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` | `_process_batch(emails)` → `[{email, success, [error]}]` per email |
-| `proxy_config.py` | `parse_proxy`, `proxies_dict` | `host:port[:user:pass]` hoặc URL | Helpers normalize to `socks5h://` URL + build `requests`/`curl_cffi` proxies dict |
-| `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point); exposes `/proxy` |
+Each enabled entry is one independent pool:
 
-`app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth.
+```json
+{
+  "refresh_token": "...",
+  "tenant_id": "...",
+  "username": "admin1",
+  "domain": "example.com",
+  "proxy": "host:port:user:pass",
+  "email_file": "email1.txt",
+  "bot_prefix": "bot_p01_",
+  "pool_id": "bot_p01",
+  "checkpoint_file": "optional.ckpt",
+  "result_file": "optional.txt",
+  "workers": 400,
+  "max_cpm": 20000,
+  "enabled": true
+}
+```
 
-### Get_Profile module structure
+`pool_id` is optional. If omitted, it is derived from `bot_prefix` by trimming trailing underscores.
+
+## Manage_User Contracts
+
+| Module | Responsibility |
+| --- | --- |
+| `pool_config.py` | Load and validate enabled pools from `admin_token_config_global.json`. |
+| `admin_token_manager.py` | Thread-safe admin OAuth manager; saves rotated refresh tokens back to the matching global config entry. |
+| `cleanup.py` | Deletes and purges users matching that pool's `bot_prefix`. |
+| `creator.py` | Creates users as `<bot_prefix><random>@<domain>`. |
+| `producer.py` | Keeps one pool queue above low watermark 400 and refills toward 800. |
+| `token_getter.py` | Browser-flow refresh token acquisition through the pool proxy. |
+| `deleter.py` | Graph batch soft-delete; caller enforces pool scope and purge. |
+| `app.py` | Flask entry point; owns pool registry and API endpoints. |
+
+Pool-scoped endpoints:
+- `GET /pools`
+- `GET /status`
+- `GET /pools/<pool_id>/status`
+- `GET /pools/<pool_id>/tokens/next?count=N`
+- `POST /pools/<pool_id>/users/delete`
+- `GET /pools/<pool_id>/proxy`
+
+Legacy endpoints `/tokens/next`, `/users/delete`, and `/proxy` are compatibility paths only. They require `pool_id` when more than one pool is configured.
+
+## Get_Profile Contracts
 
 | Package | File | Responsibility |
-|---------|------|----------------|
-| `token` | `api.go` | HTTP client for Python API (`/tokens/next`, `/users/delete`, `/proxy`) |
-| `token` | `exchange.go` | `ExchangeRefreshToken` — swap refresh_token → Loki access_token (2 retries on transient) |
-| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo; `NewManagerWithProxy` builds proxied HTTP client for token exchange |
-| `api` | `client.go` | Loki API client, connection pooling, gzip; `NewClientWithProxy` routes via SOCKS5 dialer |
-| `proxy` | `proxy.go` | `Parse` (legacy `host:port[:user:pass]` → `socks5h://` URL) + `SOCKS5DialContext` (x/net/proxy, hostname resolution on proxy side, no DNS leak) |
-| `progress` | `bitmap.go` | Line-indexed bitmap checkpoint (LoadOrCreate, atomic Set, SaveAtomic via tmp+rename, 10s auto-save) |
-| `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode, bitmap terminal-marking |
-| `reader` | `file.go` | Streaming email reader, per-line counter, bitmap skip; pushes via `pool.Submit` callback |
-| `writer` | `result.go` | Async buffered result writer |
+| --- | --- | --- |
+| `config` | `global.go` | Load/select global config pool and derive isolated checkpoint/result defaults. |
+| `token` | `api.go` | HTTP client for Manage_User; `SetPoolID` scopes paths to `/pools/<pool_id>`. |
+| `token` | `exchange.go` | Exchange refresh token to Loki access token. |
+| `token` | `manager.go` | Token queue, lazy access-token cache, dead-token notifications. |
+| `api` | `client.go` | Loki API client with optional SOCKS5 dialer. |
+| `progress` | `bitmap.go` | Resume-safe line-indexed bitmap checkpoint. |
+| `worker` | `pool.go` | Worker pool, rate limiter, terminal bitmap marking. |
+| `reader` | `file.go` | Streaming email reader with bitmap skip. |
+| `writer` | `result.go` | Async buffered result writer. |
 
-`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`, `--proxy` (override; empty = fetch once from Python `/proxy`).
+`main.go` flags of interest:
+- `--config`: global config path; auto-detects root or parent.
+- `--pool`: selected pool id; required when multiple pools are enabled.
+- `--instance`: alias for `--pool`.
+- `--emails`: override selected pool `email_file`.
+- `--checkpoint`: override default `<emails>.<pool_id>.ckpt`.
+- `--result`: override default `result_<pool_id>_<timestamp>.txt`.
+- `--proxy`: override pool proxy.
 
-### email-gen module structure
+## Key Decisions
 
-| File | Trách nhiệm |
-|------|-------------|
-| `src/main.rs` | Entry point, wiring |
-| `src/lib.rs` | Module re-exports |
-| `src/config.rs` | Cli (clap derive) + Config validation + OutputFormat |
-| `src/reader.rs` | Mmap + memchr line scan + dedup domains + load_usernames |
-| `src/generator.rs` | Rayon cross-product + ByteBudget backpressure |
-| `src/writer.rs` | Writer thread (crossbeam channel consumer) |
-| `src/splitter.rs` | File rotation + gzip wrapping (SingleFile, Splitter) |
-| `src/stats.rs` | Stats + print_vi + ram_peak (Linux /proc, Windows psapi) |
-| `src/error.rs` | thiserror enums: Config/Reader/Gen/WriterError |
-
-Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để giữ RAM < 500 MB với 200 usernames. User override bằng `-c`.
-
-### Key design decisions
-
-- **Browser flow for tokens**: `token_getter.py` uses `curl_cffi` to impersonate a browser for Microsoft Teams OAuth. Do not replace with ROPC or Graph API.
-- **1 VPS = 1 admin**: First admin from `admin_token.json` is used.
-- **User prefix `bot_`**: All app-created users have `bot_` prefix in userPrincipalName. Startup cleanup lists and deletes all `bot_` users for crash recovery.
-- **Shared AdminTokenManager**: Single `AdminTokenManager` instance handles admin OAuth for all modules. Thread-safe, auto-refresh, tracks refresh_token rotation, saves to `admin_token.json`.
-- **Refresh tokens in queue, Go exchanges lazily**: Python browser flow returns the raw refresh_token (~24h TTL) — no Loki rescope on the Python side. Queue contains refresh_token + tenant_id; Go's `token.Manager.GetAccessToken` lazily exchanges to a Loki access_token (~1h TTL) on first use and re-exchanges when the cached access_token nears expiry, so one refresh_token yields many access_tokens over its 24h window. Exchange failures retry 2× with 1s backoff; permanent failures (invalid_grant) or 401/424/500-exhausted responses still trigger user deletion as before.
-- **Permanently delete users**: All user deletions (cleanup + runtime) are permanent — soft-delete via Graph API followed by `DELETE /directory/deletedItems/{id}` to purge from recycle bin. Prevents Directory_QuotaExceeded.
-- **Graph Batch API**: Both deleter and creator use `/$batch` endpoint with `BATCH_SIZE=20` (Graph API max per batch).
-- **Threading model (Python)**: creator (2 workers), token_getter (30 workers), producer (1 background thread).
-- **Concurrency model (Go)**: 400 worker goroutines, rate limiter 20K CPM, token queue mode.
-- **Token producer auto-refill**: Background thread starts refilling when queue falls below 400 and produces toward target 800 in batches of 100. Flask waits for queue to reach 400 before accepting requests.
-- **Batch token API**: `GET /tokens/next?count=300` returns up to 300 tokens per call (cap server-side is 500). Go pre-fetches at least `max(300, workers)` tokens up to the configured high watermark, then background-refills when queue length falls below `max(100, workers)`.
-- **Batch user deletion**: Go batches dead+exhausted token emails into groups of 20, flushes every 5s or when full → `POST /users/delete` → soft-delete + permanently purge. Runtime delete sends do not drop when the channel is full; HTTP delete batches retry transient failures up to 5 attempts with backoff before logging final failure.
-- **Resume-safe bitmap checkpoint**: `progress.Bitmap` tracks per-line terminal processing (20 MB for 160M lines). Reader assigns `LineIdx` = physical line number (every line, including invalid — option A); on restart, lines with bit set are skipped. Workers set bit **only** on terminal outcomes (success, 403, 500-below-threshold, other 5xx, other errors) — **not** on token retry paths (401/424, exchange-fail, 500-exhausted). Token retry paths keep the current job in the worker and retry it with the next token, so `processed` counts terminal jobs and should match bitmap progress. Auto-save every 10s via `os.Rename(tmp, final)` → crash-safe. Fingerprint = SHA-256 of (size ‖ first 64KB ‖ last 64KB); mismatch invalidates bitmap. First run counts lines once (~10s for 5 GB); subsequent runs read totalLines from header. Reader pushes jobs directly to `pool.jobsChan` via `pool.Submit` callback (single channel, no intermediate pump goroutine).
-- **Graceful shutdown ordering**: Get_Profile cancels the token fetcher before closing token queues, waits for the dead-token bridge to drain, then closes the delete worker channel. `token.Manager.CloseQueue` is `sync.Once` protected and serialized with queue sends to avoid send-on-closed-channel panics.
-- **SOCKS5 proxy (single source of truth)**: `proxy` field of `admin_token.json` carries the SOCKS5 (legacy `host:port[:user:pass]` or `socks5h://...` URL). `proxy_config.parse_proxy` normalises to `socks5h://` so DNS resolves on the proxy (no leak, geolocation consistent for MS login). Manage_User: AdminTokenManager session + token_getter (`curl_cffi`) both route through it. Get_Profile: at startup `--proxy` overrides; otherwise calls `GET /proxy` **once** to fetch the URL — no runtime reload. The same dialer is shared by Loki client (`api.NewClientWithProxy`) and refresh-token exchange (`token.NewManagerWithProxy`). Localhost API calls (`/tokens/next`, `/users/delete`) always go direct. Changing the proxy in `Manage_User/admin_token.json` requires **restarting Get_Profile** (Manage_User picks it up next admin-OAuth refresh).
+- No Redis. Manage_User and Get_Profile communicate through localhost HTTP.
+- One global config can contain many admin/proxy/email pools.
+- Refresh tokens remain in the Python queue; Go exchanges lazily into Loki access tokens.
+- User deletion is pool-scoped. Runtime delete rejects emails outside the selected pool domain or `bot_prefix`.
+- Startup cleanup only touches the configured pool `bot_prefix`.
+- Changing a pool proxy requires restarting Get_Profile for that pool.
+- Checkpoints must remain pool-isolated unless the caller explicitly overrides `--checkpoint`.
 
 ## Environments
 
-- **Test**: Windows, `localhost:5000` (Flask dev server)
-- **Production**: Ubuntu Linux VPS, `localhost:5000` (consider gunicorn for production)
-
-Code must be cross-platform. No `ctypes.windll`, no `os.system("clear")`, use `pathlib.Path` for file paths (Python), forward slashes (Go).
+- Test: Windows, localhost:5000.
+- Production: Ubuntu Linux VPS, localhost:5000.
+- Code must stay cross-platform. Avoid OS-specific shell assumptions in app logic.

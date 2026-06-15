@@ -1,7 +1,7 @@
 """
 Proxy configuration parser.
 
-Reads the `proxy` field from admin_token.json and converts the legacy
+Reads the `proxy` field from admin_token_config_global.json and converts the legacy
 `host:port:user:pass` 4-tuple format into a SOCKS5 URL usable by both
 `requests` (via PySocks) and `curl_cffi` (via libcurl).
 

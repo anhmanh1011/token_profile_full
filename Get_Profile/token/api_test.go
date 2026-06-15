@@ -76,3 +76,44 @@ func TestDeleteWorkerFlushesQueuedEmails(t *testing.T) {
 		t.Fatal("delete worker did not send batch")
 	}
 }
+
+func TestAPIClientUsesPoolScopedPaths(t *testing.T) {
+	seen := make(map[string]bool)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen[r.Method+" "+r.URL.String()] = true
+		switch r.URL.Path {
+		case "/pools/bot_p01/proxy":
+			_, _ = w.Write([]byte(`{"proxy":"socks5h://127.0.0.1:1080"}`))
+		case "/pools/bot_p01/tokens/next":
+			_, _ = w.Write([]byte(`{"tokens":[],"count":0}`))
+		case "/pools/bot_p01/users/delete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	client := NewAPIClient(server.URL)
+	client.SetPoolID("bot_p01")
+
+	if _, err := client.FetchProxy(); err != nil {
+		t.Fatalf("FetchProxy: %v", err)
+	}
+	if _, err := client.FetchTokens(123); err != nil {
+		t.Fatalf("FetchTokens: %v", err)
+	}
+	if err := client.sendDeleteBatch(context.Background(), []string{"a@example.com"}); err != nil {
+		t.Fatalf("sendDeleteBatch: %v", err)
+	}
+
+	for _, want := range []string{
+		"GET /pools/bot_p01/proxy",
+		"GET /pools/bot_p01/tokens/next?count=123",
+		"POST /pools/bot_p01/users/delete",
+	} {
+		if !seen[want] {
+			t.Fatalf("missing request %s; saw %#v", want, seen)
+		}
+	}
+}

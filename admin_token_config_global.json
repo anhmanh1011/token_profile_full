@@ -1,0 +1,30 @@
+[
+    {
+        "refresh_token": "refresh_token_value1",
+        "tenant_id": "tenant_id1",
+        "username": "username_admin1",
+        "domain": "domain1",
+        "proxy": "proxy1",
+        "email_file": "email1.txt",
+        "bot_prefix": "bot_p01_"
+    },
+    {
+        "refresh_token": "refresh_token_value2",
+        "tenant_id": "tenant_id2",
+        "username": "username_admin2",
+        "domain": "domain2",
+        "proxy": "proxy2",
+        "email_file": "email2.txt",
+        "bot_prefix": "bot_p02_"
+
+    },
+    {
+        "refresh_token": "refresh_token_value3",
+        "tenant_id": "tenant_id3",
+        "username": "username_admin3",
+        "domain": "domain3",
+        "proxy": "proxy3",
+        "email_file": "email3.txt",
+        "bot_prefix": "bot_p03_"
+    }
+]

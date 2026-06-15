@@ -23,11 +23,19 @@ POLL_INTERVAL = 30  # seconds to sleep when queue is full
 
 
 class TokenProducer:
-    """Background producer that keeps token queue filled."""
+    """Background producer that keeps one pool's token queue filled."""
 
-    def __init__(self, token_mgr: AdminTokenManager, token_queue: queue.Queue):
+    def __init__(
+        self,
+        token_mgr: AdminTokenManager,
+        token_queue: queue.Queue,
+        bot_prefix: str = "bot_",
+        pool_id: str = "",
+    ):
         self.token_mgr = token_mgr
         self.token_queue = token_queue
+        self.bot_prefix = bot_prefix
+        self.pool_id = pool_id
         self.running = False
         self.thread: threading.Thread | None = None
 
@@ -41,10 +49,12 @@ class TokenProducer:
     def start(self) -> None:
         """Start producer in background thread."""
         self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True, name="producer")
+        thread_name = f"producer-{self.pool_id}" if self.pool_id else "producer"
+        self.thread = threading.Thread(target=self._run, daemon=True, name=thread_name)
         self.thread.start()
         logger.info(
-            "Producer started (low queue: %d, target queue: %d, batch: %d)",
+            "Producer started (pool=%s, low queue: %d, target queue: %d, batch: %d)",
+            self.pool_id or "-",
             MIN_QUEUE_SIZE,
             TARGET_QUEUE_SIZE,
             BATCH_SIZE,
@@ -72,8 +82,13 @@ class TokenProducer:
             try:
                 current_size = self.token_queue.qsize()
                 if current_size >= MIN_QUEUE_SIZE:
-                    logger.debug("Queue has %d tokens (>= %d), sleeping %ds",
-                                 current_size, MIN_QUEUE_SIZE, POLL_INTERVAL)
+                    logger.debug(
+                        "Pool %s queue has %d tokens (>= %d), sleeping %ds",
+                        self.pool_id or "-",
+                        current_size,
+                        MIN_QUEUE_SIZE,
+                        POLL_INTERVAL,
+                    )
                     time.sleep(POLL_INTERVAL)
                     continue
 
@@ -81,7 +96,12 @@ class TokenProducer:
                 if need <= 0:
                     time.sleep(POLL_INTERVAL)
                     continue
-                logger.info("Queue has %d tokens, producing %d more", current_size, need)
+                logger.info(
+                    "Pool %s queue has %d tokens, producing %d more",
+                    self.pool_id or "-",
+                    current_size,
+                    need,
+                )
                 self._produce_batch(need)
 
             except Exception as e:
@@ -91,7 +111,7 @@ class TokenProducer:
     def _produce_batch(self, count: int) -> None:
         """Create users, get tokens, push to queue."""
         # Step 1: Create users
-        creator = BulkUserCreator(self.token_mgr, count)
+        creator = BulkUserCreator(self.token_mgr, count, bot_prefix=self.bot_prefix)
         create_result = creator.run()
         created_users = create_result["created_users"]
 
@@ -113,12 +133,13 @@ class TokenProducer:
 
         # Fallback: TeamOutLook scrapes tenant_id from MS response headers; when
         # that regex misses (header format changes) the field comes back empty.
-        # All bot_* users are created in the admin's tenant, so use it as the
+        # All pool bot users are created in the admin's tenant, so use it as the
         # default — Go's exchange step needs a non-empty tenant_id.
         admin_tenant = self.token_mgr.tenant_id
         for tok in tokens:
             if not tok.get("tenant_id"):
                 tok["tenant_id"] = admin_tenant
+            tok["pool_id"] = self.pool_id
 
         with self.stats_lock:
             self.total_tokens += len(tokens)

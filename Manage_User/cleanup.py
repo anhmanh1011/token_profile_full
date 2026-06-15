@@ -1,9 +1,8 @@
 """
-Startup Cleanup — List and delete all bot_ prefix users from a Microsoft 365 tenant.
+Startup Cleanup - list and delete pool-prefixed users from a Microsoft 365 tenant.
 
-Called at service startup to remove orphaned bot_ users from previous runs
-(crash recovery). The bot_ prefix in userPrincipalName is the source of truth —
-any user with that prefix was created by this application.
+Called at service startup to remove orphaned users from previous runs.
+The configured pool bot_prefix is the source of truth.
 """
 import logging
 import time
@@ -17,19 +16,20 @@ logger = logging.getLogger(__name__)
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 BATCH_SIZE = 20
-BOT_PREFIX = "bot_"
+DEFAULT_BOT_PREFIX = "bot_"
 
 
 class StartupCleaner:
-    """List and delete all bot_ prefix users from a Microsoft 365 tenant.
+    """List and delete all pool-prefixed users from a Microsoft 365 tenant.
 
-    Uses the bot_ userPrincipalName prefix as the sole source of truth.
+    Uses the configured userPrincipalName prefix as the sole source of truth.
     Designed for startup crash recovery — no Redis dependency.
     """
 
-    def __init__(self, token_mgr: AdminTokenManager) -> None:
+    def __init__(self, token_mgr: AdminTokenManager, bot_prefix: str = DEFAULT_BOT_PREFIX) -> None:
         self.token_mgr = token_mgr
         self.domain = token_mgr.domain
+        self.bot_prefix = bot_prefix
 
         # Stats
         self.found = 0
@@ -41,10 +41,10 @@ class StartupCleaner:
         return self.token_mgr.get_token()
 
     def _list_bot_users(self) -> list[str]:
-        """List all bot_ prefix users via Graph API with pagination.
+        """List all pool-prefixed users via Graph API with pagination.
 
         Returns:
-            List of userPrincipalName strings for all bot_ users found.
+            List of userPrincipalName strings for all matching users found.
         """
         token = self._get_token()
         if not token:
@@ -52,9 +52,10 @@ class StartupCleaner:
             return []
 
         emails: list[str] = []
+        escaped_prefix = self.bot_prefix.replace("'", "''")
         url = (
             f"{GRAPH_URL}/users"
-            f"?$filter=startsWith(userPrincipalName,'{BOT_PREFIX}')"
+            f"?$filter=startsWith(userPrincipalName,'{escaped_prefix}')"
             f"&$select=userPrincipalName"
             f"&$top=999"
         )
@@ -213,21 +214,21 @@ class StartupCleaner:
         return results
 
     def run(self) -> dict:
-        """Orchestrate startup cleanup: list bot_ users, batch delete, return stats.
+        """Orchestrate startup cleanup: list matching users, batch delete, return stats.
 
         Returns:
             {"found": int, "deleted": int, "failed": int}
         """
-        logger.info("=== Startup Cleanup: removing %s* users from %s ===", BOT_PREFIX, self.domain)
+        logger.info("=== Startup Cleanup: removing %s* users from %s ===", self.bot_prefix, self.domain)
 
         if not self._get_token():
             logger.error("Authentication failed — skipping startup cleanup")
             return {"found": 0, "deleted": 0, "failed": 0}
 
-        logger.info("Listing all %s* users...", BOT_PREFIX)
+        logger.info("Listing all %s* users...", self.bot_prefix)
         emails = self._list_bot_users()
         self.found = len(emails)
-        logger.info("Found %d bot_ user(s) to clean up", self.found)
+        logger.info("Found %d %s* user(s) to clean up", self.found, self.bot_prefix)
 
         if not emails:
             return {"found": 0, "deleted": 0, "failed": 0}
@@ -272,7 +273,7 @@ class StartupCleaner:
         return {"found": self.found, "deleted": self.deleted, "failed": self.failed, "purged": purged}
 
     def _list_deleted_bot_users(self) -> list[dict]:
-        """List bot_ users in the recycle bin (deletedItems).
+        """List matching users in the recycle bin (deletedItems).
 
         Returns:
             List of {"id": str, "upn": str} for permanently deleting.
@@ -304,7 +305,7 @@ class StartupCleaner:
                 page = resp.json()
                 for user in page.get("value", []):
                     upn = user.get("userPrincipalName", "")
-                    if upn.startswith(BOT_PREFIX):
+                    if upn.startswith(self.bot_prefix):
                         deleted_users.append({"id": user["id"], "upn": upn})
 
                 url = page.get("@odata.nextLink")
@@ -315,17 +316,17 @@ class StartupCleaner:
         return deleted_users
 
     def _purge_deleted_bot_users(self) -> int:
-        """Permanently delete all bot_ users from recycle bin via batch API.
+        """Permanently delete matching users from recycle bin via batch API.
 
         Returns:
             Number of users permanently purged.
         """
         deleted_users = self._list_deleted_bot_users()
         if not deleted_users:
-            logger.info("No bot_ users in recycle bin to purge")
+            logger.info("No %s* users in recycle bin to purge", self.bot_prefix)
             return 0
 
-        logger.info("Found %d bot_ users in recycle bin, purging...", len(deleted_users))
+        logger.info("Found %d %s* users in recycle bin, purging...", len(deleted_users), self.bot_prefix)
 
         purged = 0
         batches = [

@@ -1,7 +1,7 @@
 """
 Bulk User Creator — Create Microsoft 365 users via Graph Batch API.
 
-Generates `bot_*@<domain>` users, creates them through the `/$batch` endpoint
+Generates `<bot_prefix>*@<domain>` users, creates them through the `/$batch` endpoint
 in chunks of 20 with 2 worker threads, optionally assigns an available license,
 and returns `{created_users, failed, licensed}`.
 """
@@ -49,11 +49,13 @@ class BulkUserCreator:
         token_mgr: AdminTokenManager,
         count: int = DEFAULT_COUNT,
         license_sku: Optional[str] = None,
+        bot_prefix: str = "bot_",
     ):
         self.token_mgr = token_mgr
         self.domain = token_mgr.domain
         self.count = count
         self.license_sku = license_sku
+        self.bot_prefix = bot_prefix
 
         # Results
         self.created_users: list[dict] = []
@@ -73,14 +75,14 @@ class BulkUserCreator:
         return "".join(password)
 
     def _generate_user_data(self) -> dict:
-        # bot_ prefix for easy identification and cleanup
+        # Pool-specific prefix for safe identification and cleanup.
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        username = f"bot_{random_id}"
+        username = f"{self.bot_prefix}{random_id}"
         password = self._generate_password()
 
         return {
             "userPrincipalName": f"{username}@{self.domain}",
-            "displayName": f"Bot {random_id}",
+            "displayName": f"{self.bot_prefix}{random_id}",
             "mailNickname": username,
             "accountEnabled": True,
             "usageLocation": "US",

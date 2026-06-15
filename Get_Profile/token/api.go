@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ const (
 // It fetches the next available token and batches delete requests for consumed accounts.
 type APIClient struct {
 	baseURL    string
+	poolID     string
 	httpClient *http.Client
 	deleteChan chan string
 }
@@ -52,7 +54,7 @@ type deleteRequest struct {
 // The HTTP client has a 30-second timeout; deleteChan is buffered to 1000.
 func NewAPIClient(baseURL string) *APIClient {
 	return &APIClient{
-		baseURL: baseURL,
+		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -60,11 +62,16 @@ func NewAPIClient(baseURL string) *APIClient {
 	}
 }
 
+// SetPoolID scopes token, proxy, and delete calls to /pools/{poolID}.
+func (c *APIClient) SetPoolID(poolID string) {
+	c.poolID = strings.TrimSpace(poolID)
+}
+
 // FetchProxy calls GET {baseURL}/proxy and returns the SOCKS5 proxy URL the
 // Python service is configured to use, or "" if none. Errors are returned to
 // the caller so startup can decide whether to fall back to direct dialing.
 func (c *APIClient) FetchProxy() (string, error) {
-	resp, err := c.httpClient.Get(c.baseURL + "/proxy") //nolint:noctx
+	resp, err := c.httpClient.Get(c.endpoint("/proxy")) //nolint:noctx
 	if err != nil {
 		return "", fmt.Errorf("token/api: fetch proxy: %w", err)
 	}
@@ -91,7 +98,7 @@ func (c *APIClient) FetchProxy() (string, error) {
 // Returns nil (empty slice) when the queue is empty (202); caller should retry.
 // Connection errors are retried up to 3 times with a 5-second pause.
 func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
-	url := fmt.Sprintf("%s/tokens/next?count=%d", c.baseURL, count)
+	fetchURL := fmt.Sprintf("%s?count=%d", c.endpoint("/tokens/next"), count)
 
 	var lastErr error
 
@@ -100,7 +107,7 @@ func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
 			time.Sleep(5 * time.Second)
 		}
 
-		resp, err := c.httpClient.Get(url) //nolint:noctx
+		resp, err := c.httpClient.Get(fetchURL) //nolint:noctx
 		if err != nil {
 			lastErr = fmt.Errorf("token/api: fetch attempt %d: %w", attempt+1, err)
 			slog.Warn("token/api: fetch connection error, retrying",
@@ -243,10 +250,10 @@ func (c *APIClient) sendDeleteBatch(ctx context.Context, emails []string) error 
 		return fmt.Errorf("marshal delete request: %w", err)
 	}
 
-	url := c.baseURL + "/users/delete"
+	deleteURL := c.endpoint("/users/delete")
 	var lastErr error
 	for attempt := 1; attempt <= apiDeleteMaxAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, deleteURL, bytes.NewReader(payload))
 		if err != nil {
 			return fmt.Errorf("create delete request: %w", err)
 		}
@@ -289,6 +296,13 @@ func (c *APIClient) sendDeleteBatch(ctx context.Context, emails []string) error 
 	}
 
 	return lastErr
+}
+
+func (c *APIClient) endpoint(path string) string {
+	if c.poolID == "" {
+		return c.baseURL + path
+	}
+	return c.baseURL + "/pools/" + url.PathEscape(c.poolID) + path
 }
 
 func shouldRetryDeleteStatus(status int) bool {

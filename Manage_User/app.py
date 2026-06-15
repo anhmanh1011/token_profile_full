@@ -1,40 +1,36 @@
-"""
-Manage_User API Service
+"""Manage_User API service.
 
-Long-running HTTP service that replaces the one-shot pipeline orchestrator.
-Provides endpoints for token consumption, on-demand user deletion, and status.
-
-Endpoints:
-    GET  /tokens/next    — Pop next token from queue (202 if empty)
-    POST /users/delete   — Delete a list of users by email
-    GET  /status         — Queue and producer stats
+The service reads only ``admin_token_config_global.json``. Each enabled config
+entry becomes an independent pool with its own admin account, SOCKS5 proxy,
+token queue, producer, cleanup prefix, and delete stats.
 """
-import json
+from __future__ import annotations
+
 import logging
 import queue
 import re
 import sys
 import threading
-import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, jsonify, request
 
 from admin_token_manager import AdminTokenManager
 from cleanup import StartupCleaner
 from deleter import FastBulkDeleter
+from pool_config import PoolConfig, load_pool_configs
 from producer import TokenProducer
 
-# ── Configuration ────────────────────────────────────────────────────────────
-
-CONFIG_FILE = Path(__file__).parent / "admin_token.json"
+CONFIG_FILE = Path(__file__).resolve().parent.parent / "admin_token_config_global.json"
 LOG_FILE = Path(__file__).parent / "service.log"
 MAX_DELETE_EMAILS = 20
+MAX_TOKEN_FETCH = 500
 EMAIL_PATTERN = re.compile(
     r"^[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
 )
-
-# ── Logging ──────────────────────────────────────────────────────────────────
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,45 +43,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Global state ─────────────────────────────────────────────────────────────
-
-token_queue: queue.Queue = queue.Queue(maxsize=1000)
-
-_delete_stats: dict = {"total_deleted": 0, "total_failed_delete": 0}
-_delete_stats_lock = threading.Lock()
-
-_producer: TokenProducer | None = None
-_admin_config: dict | None = None
-_token_mgr: AdminTokenManager | None = None
-
-# ── Flask app ────────────────────────────────────────────────────────────────
-
 app = Flask(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+@dataclass
+class PoolState:
+    config: PoolConfig
+    token_mgr: AdminTokenManager
+    token_queue: queue.Queue
+    producer: TokenProducer | None = None
+    delete_stats: dict[str, int] = field(
+        default_factory=lambda: {"total_deleted": 0, "total_failed_delete": 0}
+    )
+    delete_stats_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def _load_admin_config() -> dict:
-    """Load the first admin entry from admin_token.json.
-
-    Returns:
-        The first admin dict (1 VPS = 1 admin).
-
-    Raises:
-        FileNotFoundError: If admin_token.json does not exist.
-        ValueError: If the config file is empty or not a list.
-    """
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        admins = json.load(f)
-
-    if not isinstance(admins, list) or not admins:
-        raise ValueError(f"{CONFIG_FILE} must be a non-empty JSON array")
-
-    return admins[0]
+_pools: dict[str, PoolState] = {}
+_pools_lock = threading.Lock()
 
 
-def _validate_delete_emails(emails: list) -> str | None:
+def _validate_delete_emails(emails: list[Any]) -> str | None:
     if len(emails) > MAX_DELETE_EMAILS:
         return f"emails list must contain at most {MAX_DELETE_EMAILS} items"
 
@@ -98,96 +75,186 @@ def _validate_delete_emails(emails: list) -> str | None:
     return None
 
 
-GRAPH_URL = "https://graph.microsoft.com/v1.0"
+def _validate_pool_delete_emails(pool: PoolState, emails: list[str]) -> str | None:
+    prefix = pool.config.bot_prefix.lower()
+    domain = pool.config.domain.lower()
+
+    for email in emails:
+        local, sep, email_domain = email.lower().partition("@")
+        if sep != "@" or email_domain != domain:
+            return f"email {email!r} is outside pool {pool.config.pool_id}"
+        if not local.startswith(prefix):
+            return f"email {email!r} does not match pool prefix {pool.config.bot_prefix!r}"
+
+    return None
 
 
-def _purge_users(emails: list[str]) -> None:
+def _pool_status(pool: PoolState) -> dict[str, Any]:
+    producer_stats = (
+        pool.producer.stats()
+        if pool.producer is not None
+        else {
+            "total_created": 0,
+            "total_tokens": 0,
+            "total_failed_create": 0,
+            "total_failed_token": 0,
+        }
+    )
+    with pool.delete_stats_lock:
+        delete_snapshot = dict(pool.delete_stats)
+
+    return {
+        "pool_id": pool.config.pool_id,
+        "domain": pool.config.domain,
+        "username": pool.config.username,
+        "email_file": pool.config.email_file,
+        "bot_prefix": pool.config.bot_prefix,
+        "proxy_configured": bool(pool.token_mgr.proxy_url),
+        "queue_size": pool.token_queue.qsize(),
+        "producer_running": bool(pool.producer and pool.producer.running),
+        "total_created": producer_stats.get("total_created", 0),
+        "total_tokens": producer_stats.get("total_tokens", 0),
+        "total_failed_create": producer_stats.get("total_failed_create", 0),
+        "total_failed_token": producer_stats.get("total_failed_token", 0),
+        "total_deleted": delete_snapshot["total_deleted"],
+        "total_failed_delete": delete_snapshot["total_failed_delete"],
+    }
+
+
+def _resolve_pool(pool_id: str | None = None):
+    requested = (pool_id or request.args.get("pool_id") or "").strip()
+    if not requested and request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            requested = str(body.get("pool_id") or "").strip()
+
+    with _pools_lock:
+        if not _pools:
+            return None, (jsonify({"error": "Service not initialised"}), 503)
+        if not requested:
+            if len(_pools) == 1:
+                return next(iter(_pools.values())), None
+            return None, (
+                jsonify({"error": "pool_id is required when multiple pools are configured"}),
+                400,
+            )
+        pool = _pools.get(requested)
+
+    if pool is None:
+        return None, (jsonify({"error": f"unknown pool_id: {requested}"}), 404)
+    return pool, None
+
+
+def _purge_users(pool: PoolState, emails: list[str]) -> None:
     """Permanently delete users from recycle bin by email (best-effort)."""
-    if not _token_mgr:
-        return
-    token = _token_mgr.get_token()
+    token = pool.token_mgr.get_token()
     if not token:
         return
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Find deleted user IDs by email
     user_ids = []
     for email in emails:
         try:
-            resp = _token_mgr.session.get(
+            resp = pool.token_mgr.session.get(
                 f"{GRAPH_URL}/directory/deletedItems/microsoft.graph.user"
                 f"?$filter=userPrincipalName eq '{email}'&$select=id",
-                headers=headers, timeout=10,
+                headers=headers,
+                timeout=10,
             )
             if resp.status_code == 200:
-                for u in resp.json().get("value", []):
-                    user_ids.append(u["id"])
+                for user in resp.json().get("value", []):
+                    user_ids.append(user["id"])
         except Exception:
-            pass
+            logger.debug("Purge lookup failed for %s", email, exc_info=True)
 
     if not user_ids:
         return
 
-    # Batch permanently delete
-    reqs = [
+    requests_list = [
         {"id": str(i), "method": "DELETE", "url": f"/directory/deletedItems/{uid}"}
         for i, uid in enumerate(user_ids)
     ]
     try:
-        _token_mgr.session.post(
-            f"{GRAPH_URL}/$batch", headers=headers,
-            json={"requests": reqs}, timeout=60,
+        pool.token_mgr.session.post(
+            f"{GRAPH_URL}/$batch",
+            headers=headers,
+            json={"requests": requests_list},
+            timeout=60,
         )
     except Exception as e:
-        logger.warning("Purge batch error: %s", e)
+        logger.warning("Purge batch error for pool %s: %s", pool.config.pool_id, e)
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+def _tokens_response(pool: PoolState):
+    count = request.args.get("count", 100, type=int)
+    if count is None or count < 1:
+        return jsonify({"error": "count must be a positive integer"}), 400
+    count = min(count, MAX_TOKEN_FETCH)
 
-
-@app.get("/tokens/next")
-def get_next_token():
-    """Pop tokens from the in-memory queue.
-
-    Query params:
-        count: number of tokens to return (default 100, max 200)
-
-    Returns:
-        200: {"tokens": [{...}, ...], "count": N}
-        202: {"waiting": true, "count": 0}  — queue is currently empty
-    """
-    count = min(request.args.get("count", 100, type=int), 500)
     tokens = []
     for _ in range(count):
         try:
-            tok = token_queue.get_nowait()
-            tokens.append({
-                "email": tok["email"],
-                "refresh_token": tok["refresh_token"],
-                "tenant_id": tok["tenant_id"],
-            })
+            tok = pool.token_queue.get_nowait()
+            tokens.append(
+                {
+                    "email": tok["email"],
+                    "refresh_token": tok["refresh_token"],
+                    "tenant_id": tok["tenant_id"],
+                    "pool_id": pool.config.pool_id,
+                }
+            )
         except queue.Empty:
             break
 
     if not tokens:
-        return jsonify({"waiting": True, "count": 0}), 202
+        return jsonify({"waiting": True, "count": 0, "pool_id": pool.config.pool_id}), 202
 
-    return jsonify({"tokens": tokens, "count": len(tokens)}), 200
+    return jsonify({"tokens": tokens, "count": len(tokens), "pool_id": pool.config.pool_id}), 200
+
+
+@app.get("/pools")
+def list_pools():
+    with _pools_lock:
+        pools = [_pool_status(pool) for pool in _pools.values()]
+    return jsonify({"pool_count": len(pools), "pools": pools}), 200
+
+
+@app.get("/pools/<pool_id>/status")
+def get_pool_status(pool_id: str):
+    pool, error = _resolve_pool(pool_id)
+    if error:
+        return error
+    return jsonify(_pool_status(pool)), 200
+
+
+@app.get("/pools/<pool_id>/tokens/next")
+def get_next_token_for_pool(pool_id: str):
+    pool, error = _resolve_pool(pool_id)
+    if error:
+        return error
+    return _tokens_response(pool)
+
+
+@app.get("/tokens/next")
+def get_next_token():
+    pool, error = _resolve_pool()
+    if error:
+        return error
+    return _tokens_response(pool)
+
+
+@app.post("/pools/<pool_id>/users/delete")
+def delete_users_for_pool(pool_id: str):
+    return _delete_users(pool_id)
 
 
 @app.post("/users/delete")
 def delete_users():
-    """Delete a list of Microsoft 365 users by email.
+    return _delete_users()
 
-    Request body (JSON):
-        {"emails": ["user@domain.com", ...]}
 
-    Returns:
-        200: {"deleted": N, "failed": N}
-        400: {"error": "..."}  — malformed request
-        503: {"error": "..."}  — service not initialised yet
-    """
+def _delete_users(pool_id: str | None = None):
     body = request.get_json(silent=True)
     if not body or not isinstance(body.get("emails"), list):
         return jsonify({"error": "Request body must be JSON with 'emails' list"}), 400
@@ -197,141 +264,156 @@ def delete_users():
     if validation_error:
         return jsonify({"error": validation_error}), 400
 
+    pool, error = _resolve_pool(pool_id)
+    if error:
+        return error
+
+    pool_validation_error = _validate_pool_delete_emails(pool, emails)
+    if pool_validation_error:
+        return jsonify({"error": pool_validation_error}), 400
+
     if not emails:
-        return jsonify({"deleted": 0, "failed": 0}), 200
+        return jsonify({"deleted": 0, "failed": 0, "pool_id": pool.config.pool_id}), 200
 
-    if _token_mgr is None:
-        return jsonify({"error": "Service not initialised"}), 503
-
-    # Soft-delete via Graph API
-    deleter = FastBulkDeleter(_token_mgr)
+    deleter = FastBulkDeleter(pool.token_mgr)
     results = deleter._process_batch(emails)
 
     deleted_emails = [r["email"] for r in results if r["success"]]
     deleted = len(deleted_emails)
     failed = len(results) - deleted
 
-    # Permanently delete from recycle bin
     if deleted_emails:
-        _purge_users(deleted_emails)
+        _purge_users(pool, deleted_emails)
 
-    with _delete_stats_lock:
-        _delete_stats["total_deleted"] += deleted
-        _delete_stats["total_failed_delete"] += failed
+    with pool.delete_stats_lock:
+        pool.delete_stats["total_deleted"] += deleted
+        pool.delete_stats["total_failed_delete"] += failed
 
-    logger.info("/users/delete: %d deleted, %d failed", deleted, failed)
-    return jsonify({"deleted": deleted, "failed": failed}), 200
+    logger.info(
+        "/users/delete pool=%s: %d deleted, %d failed",
+        pool.config.pool_id,
+        deleted,
+        failed,
+    )
+    return jsonify({"deleted": deleted, "failed": failed, "pool_id": pool.config.pool_id}), 200
+
+
+@app.get("/pools/<pool_id>/proxy")
+def get_pool_proxy(pool_id: str):
+    pool, error = _resolve_pool(pool_id)
+    if error:
+        return error
+    return jsonify({"proxy": pool.token_mgr.proxy_url, "pool_id": pool.config.pool_id}), 200
 
 
 @app.get("/proxy")
 def get_proxy():
-    """Return the SOCKS5 proxy URL configured for the current admin.
-
-    Returns:
-        200: {"proxy": "socks5h://..."} or {"proxy": null} if no proxy configured.
-        503: {"error": "..."}  — service not initialised yet
-    """
-    if _token_mgr is None:
-        return jsonify({"error": "Service not initialised"}), 503
-    return jsonify({"proxy": _token_mgr.proxy_url}), 200
+    pool, error = _resolve_pool()
+    if error:
+        return error
+    return jsonify({"proxy": pool.token_mgr.proxy_url, "pool_id": pool.config.pool_id}), 200
 
 
 @app.get("/status")
 def get_status():
-    """Return current service stats.
-
-    Returns:
-        200: {
-            "queue_size": int,
-            "total_created": int,
-            "total_tokens": int,
-            "total_deleted": int,
-            "total_failed_delete": int,
-        }
-    """
-    producer_stats = _producer.stats() if _producer is not None else {
-        "total_created": 0,
-        "total_tokens": 0,
-    }
-
-    with _delete_stats_lock:
-        delete_snapshot = dict(_delete_stats)
+    with _pools_lock:
+        pools = [_pool_status(pool) for pool in _pools.values()]
 
     return jsonify(
         {
-            "queue_size": token_queue.qsize(),
-            "total_created": producer_stats.get("total_created", 0),
-            "total_tokens": producer_stats.get("total_tokens", 0),
-            "total_deleted": delete_snapshot["total_deleted"],
-            "total_failed_delete": delete_snapshot["total_failed_delete"],
+            "pool_count": len(pools),
+            "total_queue_size": sum(pool["queue_size"] for pool in pools),
+            "total_created": sum(pool["total_created"] for pool in pools),
+            "total_tokens": sum(pool["total_tokens"] for pool in pools),
+            "total_deleted": sum(pool["total_deleted"] for pool in pools),
+            "total_failed_delete": sum(pool["total_failed_delete"] for pool in pools),
+            "pools": pools,
         }
     ), 200
 
 
-# ── Service startup ───────────────────────────────────────────────────────────
+def _stop_existing_producers() -> None:
+    with _pools_lock:
+        pools = list(_pools.values())
+        _pools.clear()
+
+    for pool in pools:
+        if pool.producer is not None:
+            pool.producer.stop()
 
 
-def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
-    """Initialise and start the API service.
+def _initialise_pools(config_file: Path) -> None:
+    configs = load_pool_configs(config_file)
+    new_pools: dict[str, PoolState] = {}
 
-    Sequence:
-        1. Load admin config (first admin only).
-        2. Run StartupCleaner to remove orphaned bot_ users.
-        3. Start TokenProducer background thread.
-        4. Start Flask HTTP server.
-    """
-    global _admin_config, _producer, _token_mgr
+    for config in configs:
+        token_mgr = AdminTokenManager(
+            config.as_admin_dict(),
+            config_file=config_file,
+            config_pool_id=config.pool_id,
+        )
+        token_queue: queue.Queue = queue.Queue(maxsize=1000)
+        pool = PoolState(config=config, token_mgr=token_mgr, token_queue=token_queue)
 
+        logger.info(
+            "Loaded pool %s: domain=%s email_file=%s bot_prefix=%s proxy=%s",
+            config.pool_id,
+            config.domain,
+            config.email_file,
+            config.bot_prefix,
+            "yes" if token_mgr.proxy_url else "no",
+        )
+
+        logger.info("Running startup cleanup for pool %s...", config.pool_id)
+        try:
+            cleaner = StartupCleaner(token_mgr, bot_prefix=config.bot_prefix)
+            cleanup_result = cleaner.run()
+            logger.info(
+                "Cleanup pool %s done: found=%d deleted=%d failed=%d purged=%d",
+                config.pool_id,
+                cleanup_result["found"],
+                cleanup_result["deleted"],
+                cleanup_result["failed"],
+                cleanup_result.get("purged", 0),
+            )
+        except Exception as e:
+            logger.warning("Startup cleanup failed for pool %s: %s", config.pool_id, e)
+
+        producer = TokenProducer(
+            token_mgr,
+            token_queue,
+            bot_prefix=config.bot_prefix,
+            pool_id=config.pool_id,
+        )
+        producer.start()
+        pool.producer = producer
+        new_pools[config.pool_id] = pool
+
+    with _pools_lock:
+        _pools.clear()
+        _pools.update(new_pools)
+
+
+def start_service(
+    host: str = "0.0.0.0",
+    port: int = 5000,
+    config_file: Path = CONFIG_FILE,
+) -> None:
     logger.info("=" * 60)
     logger.info("  Manage_User API Service starting on %s:%d", host, port)
+    logger.info("  Config: %s", config_file)
     logger.info("=" * 60)
 
-    # Step 1: Load admin and create shared token manager
     try:
-        _admin_config = _load_admin_config()
-        _token_mgr = AdminTokenManager(_admin_config)
-        logger.info(
-            "Loaded admin config: domain=%s", _admin_config.get("domain", "?")
-        )
+        _stop_existing_producers()
+        _initialise_pools(Path(config_file))
     except Exception as e:
-        logger.error("Failed to load admin config: %s", e)
+        logger.error("Failed to initialise pools: %s", e)
         sys.exit(1)
 
-    # Step 2: Startup cleanup — delete orphaned bot_ users
-    logger.info("Running startup cleanup...")
-    try:
-        cleaner = StartupCleaner(_token_mgr)
-        cleanup_result = cleaner.run()
-        logger.info(
-            "Startup cleanup done: found=%d deleted=%d failed=%d purged=%d",
-            cleanup_result["found"],
-            cleanup_result["deleted"],
-            cleanup_result["failed"],
-            cleanup_result.get("purged", 0),
-        )
-    except Exception as e:
-        logger.warning("Startup cleanup encountered an error: %s", e)
-
-    # Step 3: Start token producer and wait for queue to fill
-    logger.info("Starting TokenProducer background thread...")
-    _producer = TokenProducer(_token_mgr, token_queue)
-    _producer.start()
-
-    # Step 4: Wait until queue has >= MIN_QUEUE_SIZE tokens
-    from producer import MIN_QUEUE_SIZE
-    logger.info("Waiting for queue to fill to %d tokens...", MIN_QUEUE_SIZE)
-    while token_queue.qsize() < MIN_QUEUE_SIZE:
-        size = token_queue.qsize()
-        logger.info("Queue: %d / %d tokens, waiting...", size, MIN_QUEUE_SIZE)
-        time.sleep(5)
-    logger.info("Queue ready: %d tokens", token_queue.qsize())
-
-    # Step 5: Run Flask (blocking)
-    logger.info("Flask ready — listening on %s:%d", host, port)
+    logger.info("Flask ready - listening on %s:%d", host, port)
     app.run(host=host, port=port, threaded=True)
 
-
-# ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
@@ -339,5 +421,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Manage_User API Service")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--config", type=Path, default=CONFIG_FILE)
     args = parser.parse_args()
-    start_service(host=args.host, port=args.port)
+    start_service(host=args.host, port=args.port, config_file=args.config)

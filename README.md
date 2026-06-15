@@ -1,133 +1,108 @@
 # Token Profile Full
 
-Hệ thống tự động quản lý user Microsoft 365 và thu thập LinkedIn profile.
+He thong gom 3 app doc lap:
+- `Manage_User` (Python): HTTP service tao bot users, lay refresh tokens, va xoa user het token.
+- `Get_Profile` (Go): batch job fetch LinkedIn profiles, consume token tu Manage_User.
+- `email-gen` (Rust): CLI sinh file email dau vao.
 
-## Modules
+## Global Config
 
-### [Manage_User](Manage_User/) (Python) — API Service
+`Manage_User` va `Get_Profile` chi doc `admin_token_config_global.json` o root project. Khong con doc `Manage_User/admin_token.json`.
 
-Long-running HTTP service quản lý lifecycle users:
-- **Startup cleanup**: Xóa toàn bộ `bot_` users từ lần chạy trước
-- **Background producer**: Tự động tạo users + lấy refresh tokens, giữ queue theo low watermark 400 và target 800
-- **API endpoints**: Serve tokens cho Go app, nhận yêu cầu xóa users
+Moi entry la mot pool doc lap:
 
-### [Get_Profile](Get_Profile/) (Go) — Batch Job
-
-High-performance LinkedIn profile fetcher:
-- Lấy refresh tokens từ Python API (`GET /tokens/next?count=500`), lazy-exchange sang Loki access_token khi worker cần dùng
-- 400 worker goroutines, rate limit 20K CPM
-- Call Loki API (Delve Office) lấy LinkedIn profile
-- Dead/exhausted token → batch delete users (`POST /users/delete`)
-- Output: `result_TIMESTAMP.txt`
-
-### [email-gen](email-gen/) (Rust) — CLI Utility
-
-Standalone CLI sinh `emails.txt` cho Get_Profile bằng cross-product `domains.txt × usernames.txt`:
-- Input: 1M domains + 200 usernames → 200M emails (~10 GB)
-- Target: < 60 s trên 8 core NVMe, RAM < 500 MB
-- Parallel (rayon) + mmap (memmap2) + dedicated writer thread (crossbeam channel)
-- Hỗ trợ split, gzip, csv/json format, dedup domains, shuffle chunks
-
-Chạy tay trước khi start Get_Profile:
-```bash
-cd email-gen && cargo build --release
-./target/release/email-gen -d domains.txt -u usernames.txt -o ../Get_Profile/emails.txt
+```json
+[
+  {
+    "refresh_token": "...",
+    "tenant_id": "...",
+    "username": "admin1",
+    "domain": "example.com",
+    "proxy": "host:port:user:pass",
+    "email_file": "email1.txt",
+    "bot_prefix": "bot_p01_"
+  }
+]
 ```
 
-## Kiến trúc tổng quan
+`pool_id` mac dinh duoc suy ra tu `bot_prefix` bang cach bo `_` cuoi, vi du `bot_p01_` -> `bot_p01`. Co the them field `pool_id` neu muon ten ro rang hon.
 
+## Architecture
+
+```text
+admin_token_config_global.json
+       |
+       v
+Manage_User (localhost:5000)
+  one pool per config entry
+  AdminTokenManager + StartupCleaner + TokenProducer per pool
+       |
+       | GET  /pools/<pool_id>/tokens/next?count=N
+       | POST /pools/<pool_id>/users/delete
+       | GET  /pools/<pool_id>/proxy
+       v
+Get_Profile --pool <pool_id>
+  Loki + token-exchange use that pool proxy
+  localhost Manage_User API calls stay direct
+  checkpoint defaults to <email_file>.<pool_id>.ckpt
 ```
-admin_token.json (refresh_token + tenant_id + proxy)
-       │
-       ▼
-  [Manage_User API Service]  ← Python (localhost:5000)
-   (admin OAuth + token_getter đều route qua SOCKS5)
-       │
-       ├── GET  /tokens/next      (refresh_token — Go tự exchange sang access_token)
-       ├── POST /users/delete     (batch delete)
-       ├── GET  /proxy            (SOCKS5 URL hiện tại)
-       └── GET  /status           (monitoring)
-       │
-       ▼
-  [Get_Profile]  ← Go (batch job)
-   (Loki + token-exchange route qua SOCKS5; localhost API thì direct)
-       │
-       ├── emails.txt (input: emails cần check)
-       └── result_TIMESTAMP.txt (output: LinkedIn profiles)
-```
 
-## API Endpoints
-
-| Method | Path | Response | Mô tả |
-|--------|------|----------|-------|
-| `GET` | `/tokens/next?count=N` | `{"tokens": [...], "count": N}` hoặc 202 | Lấy batch tokens (default 100, max 500) |
-| `POST` | `/users/delete` | `{"deleted": N, "failed": N}` | Batch delete users, tối đa 20 emails/request, validate email format |
-| `GET` | `/proxy` | `{"proxy": "socks5h://..."}` hoặc `{"proxy": null}` | SOCKS5 URL bound to current admin |
-| `GET` | `/status` | `{"queue_size", "total_created", ...}` | Monitoring |
-
-## Yêu cầu
-
-- Python 3.10+ (Manage_User)
-- Go 1.21+ (Get_Profile)
-- Rust 1.74+ / Cargo (email-gen) — [rustup.rs](https://rustup.rs) nếu chưa cài
-- **Không cần Redis** — giao tiếp qua HTTP localhost
-
-## Quick Start
+## Run
 
 ```bash
-# 1. Start Python API service
+# Start API service from repo root or Manage_User
 cd Manage_User
 pip install -r requirements.txt
-python app.py --port 5000
+python app.py --port 5000 --config ../admin_token_config_global.json
 
-# 2. Đợi producer tạo tokens (check /status)
-curl http://localhost:5000/status
-
-# 3. Run Go app
-cd Get_Profile
+# Run one Get_Profile instance
+cd ../Get_Profile
 go build -o get_profile.exe .
-./get_profile.exe --api http://localhost:5000 --emails emails.txt
+./get_profile.exe --api http://localhost:5000 --pool bot_p01
+
+# Run more instances in other shells
+./get_profile.exe --api http://localhost:5000 --pool bot_p02
+./get_profile.exe --api http://localhost:5000 --pool bot_p03
 ```
 
-### Get_Profile flags
+## Manage_User API
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--api` | `http://localhost:5000` | Python API service address |
-| `--workers` | `400` | Number of worker goroutines |
-| `--max-cpm` | `20000` | Max requests per minute |
-| `--emails` | `emails.txt` | Path to emails file |
-| `--result` | `result_TIMESTAMP.txt` | Path to result file |
-| `--checkpoint` | `<emails>.ckpt` | Bitmap progress file |
-| `--proxy` | (fetch từ Python `/proxy`) | SOCKS5 override; chấp nhận `host:port[:user:pass]` hoặc `socks5h://...` |
-| `--id` | | Instance ID for logging |
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/pools` | List configured pools and safe status fields. |
+| `GET` | `/status` | Aggregate status across all pools. |
+| `GET` | `/pools/<pool_id>/status` | Status for one pool. |
+| `GET` | `/pools/<pool_id>/tokens/next?count=N` | Pop up to 500 refresh tokens from that pool. |
+| `POST` | `/pools/<pool_id>/users/delete` | Delete up to 20 users; emails must match that pool domain and `bot_prefix`. |
+| `GET` | `/pools/<pool_id>/proxy` | Return that pool SOCKS5 URL. |
 
-**Proxy resolution** (Get_Profile, startup only — không reload runtime):
-1. Nếu có `--proxy` flag → dùng luôn.
-2. Ngược lại gọi `GET /proxy` của Python service (1 lần) → lấy proxy của admin hiện tại.
-3. Nếu Python service down hoặc không có proxy → fallback direct dial (cảnh báo IP thật).
+Legacy endpoints `/tokens/next`, `/users/delete`, and `/proxy` still work only when `pool_id` is supplied or exactly one pool is configured.
 
-Đổi proxy: sửa field `proxy` trong `Manage_User/admin_token.json` rồi **restart Get_Profile** (Python service tự reload).
+## Get_Profile Flags
 
-### Reliability behavior
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--config` | auto-detect root/parent `admin_token_config_global.json` | Global config path. |
+| `--pool` | required when config has multiple pools | Pool id, usually `bot_prefix` without trailing `_`. |
+| `--instance` | alias for `--pool` | Kept for command readability. |
+| `--api` | `http://localhost:5000` | Manage_User API address. |
+| `--emails` | selected `email_file` | Override email input file. |
+| `--checkpoint` | `<emails>.<pool_id>.ckpt` | Bitmap checkpoint; default is pool-isolated. |
+| `--result` | `result_<pool_id>_<timestamp>.txt` | Output file. |
+| `--workers` | `400` or config `workers` | Worker goroutines. |
+| `--max-cpm` | `20000` or config `max_cpm` | Rate limit. |
+| `--proxy` | fetched from `/pools/<pool_id>/proxy` | Manual SOCKS5 override. |
+| `--id` | pool id | Log prefix. |
 
-- `Manage_User` producer starts accepting requests after the queue reaches 400 tokens and keeps refilling toward 800 tokens.
-- `Get_Profile` pre-fetches enough tokens for the configured worker count, then refills when the token queue falls below `max(100, workers)`.
-- Worker retries caused by token exchange failure, 401/424, or token quota exhaustion do not mark checkpoint bits and do not increment `processed`; the same email is retried with the next token.
-- Terminal outcomes set the bitmap checkpoint exactly once: success, 403, below-threshold 500, other 5xx, and non-token errors.
-- Dead/exhausted token cleanup is batched in groups of 20 and retried up to 5 attempts with backoff before logging a final failure.
-- Shutdown cancels the token fetcher before closing queues and drains dead-token cleanup before exiting.
+## Verification
 
-### Manage_User flags
+```bash
+cd Manage_User
+py -m unittest discover -s . -p "test_*.py"
+py -m py_compile app.py admin_token_manager.py pool_config.py cleanup.py producer.py creator.py deleter.py token_getter.py proxy_config.py
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--host` | `0.0.0.0` | Bind host |
-| `--port` | `5000` | Bind port |
-
-## Môi trường
-
-| Env | OS | Communication |
-|-----|-----|---------------|
-| Test | Windows | HTTP localhost:5000 |
-| Production | Ubuntu Linux VPS | HTTP localhost:5000 |
+cd ../Get_Profile
+go test ./...
+go vet ./...
+go build .
+```
