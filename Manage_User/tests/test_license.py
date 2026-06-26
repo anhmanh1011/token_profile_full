@@ -63,3 +63,30 @@ def test_explicit_part_number_no_fallback_when_absent():
 
 def test_empty_sku_list_returns_none():
     assert resolve_license_sku([], "auto") is None
+
+
+from unittest.mock import MagicMock
+from creator import BulkUserCreator
+
+
+def _creator(usage_location="US", license_sku=None):
+    mgr = MagicMock()
+    mgr.domain = "tenant1.example"
+    return BulkUserCreator(mgr, count=1, license_sku=license_sku, usage_location=usage_location)
+
+
+def test_usage_location_used_in_user_data():
+    c = _creator(usage_location="VN")
+    data = c._generate_user_data()
+    assert data["usageLocation"] == "VN"
+
+
+def test_usage_location_defaults_to_us():
+    c = _creator()
+    assert c._generate_user_data()["usageLocation"] == "US"
+
+
+def test_preference_stored_separately_from_resolved_sku():
+    c = _creator(license_sku="a1-students")
+    assert c.license_pref == "a1-students"
+    assert c.license_sku is None  # not resolved until run()

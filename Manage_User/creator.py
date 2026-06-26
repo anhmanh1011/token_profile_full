@@ -122,11 +122,14 @@ class BulkUserCreator:
         token_mgr: AdminTokenManager,
         count: int = DEFAULT_COUNT,
         license_sku: Optional[str] = None,
+        usage_location: str = "US",
     ):
         self.token_mgr = token_mgr
         self.domain = token_mgr.domain
         self.count = count
-        self.license_sku = license_sku
+        self.license_pref = license_sku  # raw preference: alias / guid / part / "auto"
+        self.license_sku: Optional[str] = None  # resolved skuId, set in run()
+        self.usage_location = usage_location
 
         # Results
         self.created_users: list[dict] = []
@@ -156,7 +159,7 @@ class BulkUserCreator:
             "displayName": f"Bot {random_id}",
             "mailNickname": username,
             "accountEnabled": True,
-            "usageLocation": "US",
+            "usageLocation": self.usage_location,
             "_password": password,
             "passwordProfile": {
                 "password": password,
@@ -167,22 +170,17 @@ class BulkUserCreator:
     def _get_token(self) -> Optional[str]:
         return self.token_mgr.get_token()
 
-    def _get_available_license(self) -> Optional[str]:
+    def _resolve_license_sku(self) -> Optional[str]:
         token = self._get_token()
         if not token:
             return None
-
         headers = {"Authorization": f"Bearer {token}"}
         try:
             resp = self.token_mgr.session.get(
                 f"{GRAPH_URL}/subscribedSkus", headers=headers, timeout=30
             )
             if resp.status_code == 200:
-                for sku in resp.json().get("value", []):
-                    enabled = sku.get("prepaidUnits", {}).get("enabled", 0)
-                    consumed = sku.get("consumedUnits", 0)
-                    if enabled - consumed > 0:
-                        return sku["skuId"]
+                return resolve_license_sku(resp.json().get("value", []), self.license_pref)
         except requests.RequestException as e:
             logger.warning("Failed to get licenses: %s", e)
         return None
@@ -439,11 +437,12 @@ class BulkUserCreator:
             }
         logger.info("Authenticated successfully")
 
-        # Auto-detect license
-        if not self.license_sku:
-            self.license_sku = self._get_available_license()
-            if self.license_sku:
-                logger.info("Auto-detected license: %s", self.license_sku[:8])
+        # Resolve license preference → concrete skuId
+        self.license_sku = self._resolve_license_sku()
+        if self.license_sku:
+            logger.info("License resolved (pref=%s): skuId=%s", self.license_pref, self.license_sku)
+        else:
+            logger.warning("No license assigned (pref=%s)", self.license_pref)
 
         # Generate users
         logger.info("Generating %d users...", self.count)
