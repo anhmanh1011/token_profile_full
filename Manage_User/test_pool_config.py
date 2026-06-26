@@ -50,6 +50,26 @@ class PoolConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate pool_id"):
                 load_pool_configs(config_path)
 
+    def test_rejects_overlapping_bot_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "admin_token_config_global.json"
+            base = {
+                "refresh_token": "secret",
+                "tenant_id": "tenant",
+                "username": "admin",
+                "domain": "example.com",
+                "proxy": "",
+                "email_file": "email1.txt",
+            }
+            # "bot_p0" is a prefix of "bot_p01_": cleanup of the first pool would
+            # delete the second pool's users.
+            entry_a = {**base, "pool_id": "a", "bot_prefix": "bot_p0"}
+            entry_b = {**base, "pool_id": "b", "bot_prefix": "bot_p01_"}
+            config_path.write_text(json.dumps([entry_a, entry_b]), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "prefix"):
+                load_pool_configs(config_path)
+
 
 if __name__ == "__main__":
     unittest.main()

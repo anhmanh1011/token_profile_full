@@ -19,28 +19,32 @@ type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, 
 
 // Parse converts the legacy host:port[:user:pass] form into a normalised
 // socks5h:// URL. A value already containing "://" is returned as-is so a
-// future config entry can opt into a different scheme. Returns "" for
-// empty/malformed input.
-func Parse(raw string) string {
+// future config entry can opt into a different scheme.
+//
+// An empty/whitespace input returns ("", nil) — meaning "dial directly".
+// A non-empty value that does not match a supported shape returns an error
+// so the caller can refuse to silently fall back to a direct connection
+// (which would leak the real IP when a proxy was expected).
+func Parse(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return ""
+		return "", nil
 	}
 	if strings.Contains(raw, "://") {
-		return raw
+		return raw, nil
 	}
 	parts := strings.Split(raw, ":")
 	switch len(parts) {
 	case 2:
-		return fmt.Sprintf("socks5h://%s:%s", parts[0], parts[1])
+		return fmt.Sprintf("socks5h://%s:%s", parts[0], parts[1]), nil
 	case 4:
 		return fmt.Sprintf(
 			"socks5h://%s:%s@%s:%s",
 			url.QueryEscape(parts[2]), url.QueryEscape(parts[3]),
 			parts[0], parts[1],
-		)
+		), nil
 	}
-	return ""
+	return "", fmt.Errorf("proxy: malformed value %q; expected host:port or host:port:user:pass or a scheme:// URL", raw)
 }
 
 // SOCKS5DialContext returns a DialContext function that routes TCP connections

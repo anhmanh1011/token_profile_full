@@ -37,7 +37,12 @@ func NewClient(timeoutSeconds int) *Client {
 func NewClientWithProxy(timeoutSeconds int, proxyURL string) *Client {
 	timeout := time.Duration(timeoutSeconds) * time.Second
 
-	dial, err := proxy.SOCKS5DialContext(proxy.Parse(proxyURL), 5*time.Second, 30*time.Second)
+	parsedProxy, err := proxy.Parse(proxyURL)
+	if err != nil {
+		slog.Error("api: invalid proxy value, falling back to direct (Loki traffic will use the real IP)", "err", err)
+		parsedProxy = ""
+	}
+	dial, err := proxy.SOCKS5DialContext(parsedProxy, 5*time.Second, 30*time.Second)
 	if err != nil {
 		slog.Error("api: failed to build SOCKS5 dialer, falling back to direct", "err", err)
 		dial, _ = proxy.SOCKS5DialContext("", 5*time.Second, 30*time.Second)

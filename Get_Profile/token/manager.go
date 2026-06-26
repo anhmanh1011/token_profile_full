@@ -78,7 +78,12 @@ func NewManager() *Manager {
 // Pass an empty string to dial directly. Malformed proxy URLs degrade to
 // direct dialing with a logged error rather than failing startup.
 func NewManagerWithProxy(proxyURL string) *Manager {
-	dial, err := proxy.SOCKS5DialContext(proxy.Parse(proxyURL), 5*time.Second, 30*time.Second)
+	parsedProxy, err := proxy.Parse(proxyURL)
+	if err != nil {
+		slog.Error("token/manager: invalid proxy value, falling back to direct (token-exchange traffic will use the real IP)", "err", err)
+		parsedProxy = ""
+	}
+	dial, err := proxy.SOCKS5DialContext(parsedProxy, 5*time.Second, 30*time.Second)
 	if err != nil {
 		slog.Error("token/manager: failed to build SOCKS5 dialer, falling back to direct", "err", err)
 		dial, _ = proxy.SOCKS5DialContext("", 5*time.Second, 30*time.Second)
@@ -317,5 +322,15 @@ func (m *Manager) notifyDead(username string) {
 	if m.deadChan == nil || username == "" {
 		return
 	}
-	m.deadChan <- username
+	// Non-blocking send: notifyDead runs on worker goroutines via
+	// MarkDeadAndRelease / MarkQuotaExhausted. A blocking send here would stall
+	// workers if the deadChan→delete bridge falls behind. The buffer (1000) is
+	// the backpressure window; if it overflows we drop the cleanup notification
+	// rather than block fetching — the orphaned user is reclaimed by the next
+	// StartupCleaner run.
+	select {
+	case m.deadChan <- username:
+	default:
+		slog.Warn("token/manager: dead-token channel full, dropping cleanup notification", "user", username)
+	}
 }

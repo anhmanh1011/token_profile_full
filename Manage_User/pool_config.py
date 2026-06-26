@@ -69,6 +69,21 @@ def load_pool_configs(config_file: Path) -> list[PoolConfig]:
 
     if not pools:
         raise ValueError(f"{config_file} has no enabled pools")
+
+    # Cleanup matches users by ``startswith(bot_prefix)``. Distinct strings are
+    # not enough: if one prefix is a prefix of another (e.g. "bot_p0" vs
+    # "bot_p01_"), the shorter pool's cleanup would delete the longer pool's
+    # users. Reject any such overlap so pools stay isolated.
+    for outer in pools:
+        for inner in pools:
+            if outer is inner:
+                continue
+            if inner.bot_prefix.startswith(outer.bot_prefix):
+                raise ValueError(
+                    f"bot_prefix {outer.bot_prefix!r} (pool {outer.pool_id}) is a prefix of "
+                    f"{inner.bot_prefix!r} (pool {inner.pool_id}); prefixes must not overlap"
+                )
+
     return pools
 
 

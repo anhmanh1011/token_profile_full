@@ -28,6 +28,11 @@ const (
 	tokenFetchBatchSize        = 300
 	tokenQueueBaseCapacity     = 2000
 	tokenQueueBaseLowWatermark = 100
+
+	// prefetchMaxWait bounds how long startup will wait for the Python service
+	// to populate its token queue before giving up. Without this, an empty or
+	// backlogged producer would make startup hang indefinitely.
+	prefetchMaxWait = 5 * time.Minute
 )
 
 func main() {
@@ -204,6 +209,7 @@ func main() {
 	// Pre-fetch enough tokens for the configured worker count.
 	log.Println("[TOKEN] Fetching initial tokens from API...")
 	var fetched int
+	prefetchDeadline := time.Now().Add(prefetchMaxWait)
 	for tokenManager.QueueLen() < initialTokenTarget {
 		tokens, err := apiClient.FetchTokens(tokenFetchBatchSize)
 		if err != nil {
@@ -214,6 +220,13 @@ func main() {
 			break
 		}
 		if tokens == nil {
+			if time.Now().After(prefetchDeadline) {
+				if fetched == 0 {
+					log.Fatalf("[ERROR] Pre-fetch timed out after %s: Python token queue stayed empty", prefetchMaxWait)
+				}
+				log.Printf("[TOKEN] Pre-fetch deadline reached after %s with %d tokens; proceeding", prefetchMaxWait, fetched)
+				break
+			}
 			log.Println("[TOKEN] Pre-fetch: API queue empty, waiting 2s...")
 			time.Sleep(2 * time.Second)
 			continue
