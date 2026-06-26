@@ -24,9 +24,17 @@ POLL_INTERVAL = 30  # seconds to sleep when queue is full
 class TokenProducer:
     """Background producer that keeps token queue filled."""
 
-    def __init__(self, token_mgr: AdminTokenManager, token_queue: queue.Queue):
+    def __init__(
+        self,
+        token_mgr: AdminTokenManager,
+        token_queue: queue.Queue,
+        license_sku: str | None = None,
+        usage_location: str = "US",
+    ):
         self.token_mgr = token_mgr
         self.token_queue = token_queue
+        self.license_sku = license_sku
+        self.usage_location = usage_location
         self.running = False
         self.thread: threading.Thread | None = None
 
@@ -82,7 +90,10 @@ class TokenProducer:
     def _produce_batch(self, count: int) -> None:
         """Create users, get tokens, push to queue."""
         # Step 1: Create users
-        creator = BulkUserCreator(self.token_mgr, count)
+        creator = BulkUserCreator(
+            self.token_mgr, count,
+            license_sku=self.license_sku, usage_location=self.usage_location,
+        )
         create_result = creator.run()
         created_users = create_result["created_users"]
 
