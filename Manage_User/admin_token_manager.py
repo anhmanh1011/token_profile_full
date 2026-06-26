@@ -14,6 +14,8 @@ from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from source_ip import SourceAddressAdapter, parse_local_ip
+
 logger = logging.getLogger(__name__)
 
 CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
@@ -27,6 +29,8 @@ class AdminTokenManager:
         self.tenant_id = admin["tenant_id"]
         self.refresh_token = admin["refresh_token"]
         self.domain = admin.get("domain", "")
+        # Per-tenant outbound source IP (callout IP). None = OS default route.
+        self.local_ip = parse_local_ip(admin.get("local_ip"))
 
         self._access_token: Optional[str] = None
         self._token_expires: float = 0
@@ -36,10 +40,19 @@ class AdminTokenManager:
         self._original_refresh_token = self.refresh_token
         self._refresh_token_updated = False
 
-        # Shared session with connection pooling
+        # Shared session with connection pooling. When a callout IP is set,
+        # bind every Graph/OAuth socket to it so this tenant always egresses
+        # from its own VPS address.
         self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
+        if self.local_ip:
+            adapter = SourceAddressAdapter(
+                self.local_ip, pool_connections=100, pool_maxsize=100, max_retries=3
+            )
+            logger.info("AdminTokenManager: binding outbound to %s", self.local_ip)
+        else:
+            adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
         self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def get_token(self) -> Optional[str]:
         """Get a valid access_token, refreshing if expired. Thread-safe."""

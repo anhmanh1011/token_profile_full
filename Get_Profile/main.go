@@ -34,6 +34,7 @@ func main() {
 	instanceID := flag.String("id", "", "Instance ID for logging (optional)")
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.ckpt)")
+	localIP := flag.String("local-ip", "", "Outbound source/callout IP for Loki + token-exchange traffic (this tenant's VPS IP)")
 	flag.Parse()
 
 	// Generate timestamped filenames
@@ -103,12 +104,18 @@ func main() {
 	totalEmails := int(bitmap.TotalLines())
 	log.Printf("[CHECKPOINT] Total lines: %d | Already done: %d", totalEmails, bitmap.Done())
 
-	// Create API client for token fetching and user deletion
+	// Create API client for token fetching and user deletion.
+	// This talks to the local Python service over loopback, so it is NOT bound
+	// to the callout IP (binding a public IP would break 127.0.0.1 dialing).
 	apiClient := token.NewAPIClient(cfg.APIAddr)
 	log.Printf("[API] Token API client initialized: %s", cfg.APIAddr)
 
-	// Initialize token manager with empty queue
-	tokenManager := token.NewManager()
+	if *localIP != "" {
+		log.Printf("[CALLOUT] Binding Loki + token-exchange traffic to source IP %s", *localIP)
+	}
+
+	// Initialize token manager with empty queue (token-exchange bound to callout IP)
+	tokenManager := token.NewManagerWithLocalIP(*localIP)
 	tokenManager.InitEmptyQueue(2000)
 	log.Println("[TOKEN] Queue mode enabled (empty queue, pre-fetching tokens...)")
 
@@ -198,7 +205,7 @@ func main() {
 	log.Printf("[WRITER] Output file: %s", cfg.ResultsFile)
 
 	// Initialize Loki API client
-	lokiClient := api.NewClient(cfg.APITimeout)
+	lokiClient := api.NewClientWithLocalIP(cfg.APITimeout, *localIP)
 	log.Println("[API] Loki client initialized")
 
 	// Initialize worker pool

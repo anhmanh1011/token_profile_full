@@ -3,6 +3,7 @@ package token
 import (
 	"errors"
 	"fmt"
+	"linkedin_fetcher/netbind"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -63,12 +64,33 @@ type Manager struct {
 	deadChan chan<- string
 }
 
-// NewManager creates a new token manager
+// NewManager creates a new token manager that exchanges refresh tokens from the
+// OS default route.
 func NewManager() *Manager {
+	return NewManagerWithLocalIP("")
+}
+
+// NewManagerWithLocalIP creates a token manager whose refresh_token →
+// access_token exchange traffic egresses from localIP (the tenant's callout
+// IP). Pass "" to dial from the OS default route. A malformed localIP degrades
+// to the default route with a logged error rather than failing startup.
+func NewManagerWithLocalIP(localIP string) *Manager {
+	dial, err := netbind.DialContext(localIP, 5*time.Second, 30*time.Second)
+	if err != nil {
+		slog.Error("token/manager: invalid local IP, falling back to default route (token-exchange traffic will use the default IP)", "err", err)
+	}
 	return &Manager{
 		tokenInfos: make([]*TokenInfo, 0),
 		exchangeClient: &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           dial,
+				MaxIdleConns:          200,
+				MaxIdleConnsPerHost:   100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 		},
 	}
 }

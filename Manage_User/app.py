@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, jsonify, request
 
@@ -61,21 +62,24 @@ app = Flask(__name__)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _load_admin_config() -> dict:
-    """Load the first admin entry from admin_token.json.
+def _load_admin_config(config_file: Path = CONFIG_FILE) -> dict:
+    """Load the first admin entry from the given admin_token config file.
+
+    Each tenant instance points ``--config`` at its own file (one admin each),
+    so running two tenants on one VPS is just two processes with two files.
 
     Returns:
-        The first admin dict (1 VPS = 1 admin).
+        The first admin dict (1 instance = 1 admin).
 
     Raises:
-        FileNotFoundError: If admin_token.json does not exist.
+        FileNotFoundError: If the config file does not exist.
         ValueError: If the config file is empty or not a list.
     """
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(config_file, "r", encoding="utf-8") as f:
         admins = json.load(f)
 
     if not isinstance(admins, list) or not admins:
-        raise ValueError(f"{CONFIG_FILE} must be a non-empty JSON array")
+        raise ValueError(f"{config_file} must be a non-empty JSON array")
 
     return admins[0]
 
@@ -236,7 +240,12 @@ def get_status():
 # ── Service startup ───────────────────────────────────────────────────────────
 
 
-def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
+def start_service(
+    host: str = "0.0.0.0",
+    port: int = 5000,
+    config_file: Path = CONFIG_FILE,
+    local_ip: Optional[str] = None,
+) -> None:
     """Initialise and start the API service.
 
     Sequence:
@@ -244,6 +253,10 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
         2. Run StartupCleaner to remove orphaned bot_ users.
         3. Start TokenProducer background thread.
         4. Start Flask HTTP server.
+
+    ``local_ip`` (CLI ``--local-ip``) overrides the config file's ``local_ip``
+    for the outbound callout IP, letting deployment scripts pin the egress
+    address without editing the config.
     """
     global _admin_config, _producer, _token_mgr
 
@@ -253,7 +266,9 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
 
     # Step 1: Load admin and create shared token manager
     try:
-        _admin_config = _load_admin_config()
+        _admin_config = _load_admin_config(config_file)
+        if local_ip:
+            _admin_config["local_ip"] = local_ip
         _token_mgr = AdminTokenManager(_admin_config)
         logger.info(
             "Loaded admin config: domain=%s", _admin_config.get("domain", "?")
@@ -304,5 +319,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Manage_User API Service")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument(
+        "--config",
+        default=str(CONFIG_FILE),
+        help="Path to this tenant's admin_token JSON file",
+    )
+    parser.add_argument(
+        "--local-ip",
+        default=None,
+        help="Outbound source/callout IP for this tenant (overrides config local_ip)",
+    )
     args = parser.parse_args()
-    start_service(host=args.host, port=args.port)
+    start_service(
+        host=args.host,
+        port=args.port,
+        config_file=Path(args.config),
+        local_ip=args.local_ip,
+    )

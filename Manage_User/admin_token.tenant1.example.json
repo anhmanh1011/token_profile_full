@@ -1,0 +1,9 @@
+[
+  {
+    "refresh_token": "<TENANT1_REFRESH_TOKEN>",
+    "tenant_id": "<TENANT1_TENANT_ID>",
+    "username": "admin@tenant1.example",
+    "domain": "tenant1.example",
+    "local_ip": "203.0.113.10"
+  }
+]

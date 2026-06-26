@@ -8,13 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Manage_User: start API service
 cd Manage_User && pip install -r requirements.txt
 cd Manage_User && python app.py --port 5000
+# Per-tenant (callout IP): --config <admin file> --local-ip <vps source IP>
+cd Manage_User && python app.py --port 5000 --config admin_token.tenant1.json --local-ip 203.0.113.10
 
 # Get_Profile: build & run
 cd Get_Profile && go build -o get_profile.exe .
 cd Get_Profile && ./get_profile.exe --api http://localhost:5000
+# Per-tenant (callout IP):
+cd Get_Profile && ./get_profile.exe --api http://localhost:5000 --local-ip 203.0.113.10
 
 # Syntax check Python modules
-cd Manage_User && python -m py_compile app.py && python -m py_compile cleanup.py && python -m py_compile producer.py && python -m py_compile creator.py && python -m py_compile deleter.py && python -m py_compile token_getter.py
+cd Manage_User && python -m py_compile app.py && python -m py_compile cleanup.py && python -m py_compile producer.py && python -m py_compile creator.py && python -m py_compile deleter.py && python -m py_compile token_getter.py && python -m py_compile source_ip.py && python -m py_compile admin_token_manager.py
 
 # Build & vet Go modules
 cd Get_Profile && go build . && go vet ./...
@@ -55,19 +59,26 @@ admin_token.json
        └── POST /users/delete (batch 20, dead token cleanup)
 ```
 
+**Dual-tenant on one VPS:** run two process sets (Manage_User + Get_Profile),
+each with its own admin file (`--config`) and its own callout IP (`--local-ip`),
+e.g. tenant 1 → IPv4, tenant 2 → IPv6. External traffic (Graph/OAuth, Teams
+flow, Loki, token-exchange) egresses from the tenant's IP; localhost API traffic
+stays on loopback. See `DEPLOY_DUAL_TENANT.md`.
+
 ### Manage_User module contracts
 
 | Module | Class | Input | Output |
 |--------|-------|-------|--------|
-| `admin_token_manager.py` | `AdminTokenManager` | admin dict | Shared OAuth token manager (thread-safe, auto-refresh, rotation tracking) |
+| `admin_token_manager.py` | `AdminTokenManager` | admin dict (incl. optional `local_ip`) | Shared OAuth token manager (thread-safe, auto-refresh, rotation tracking); binds its `requests` session to `local_ip` |
+| `source_ip.py` | `SourceAddressAdapter`, `parse_local_ip`, `curl_interface` | callout IP string | `requests` adapter (urllib3 `source_address`) + curl_cffi `interface` value for per-tenant source-IP binding |
 | `cleanup.py` | `StartupCleaner` | `AdminTokenManager` | `{found, deleted, failed, purged}` — soft-delete + permanently purge `bot_` users |
 | `creator.py` | `BulkUserCreator` | `AdminTokenManager`, count | `{created_users: [{email, password}], failed, licensed}` |
-| `token_getter.py` | `BulkTokenGetter` | `[{email, password}]` | `{tokens: [{email, refresh_token, tenant_id}], failed}` |
-| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥100 tokens in queue |
+| `token_getter.py` | `BulkTokenGetter` | `[{email, password}]`, optional `local_ip` | `{tokens: [{email, refresh_token, tenant_id}], failed}`; curl_cffi sessions bound to `local_ip` |
+| `producer.py` | `TokenProducer` | `AdminTokenManager`, queue.Queue | Background thread, keeps ≥100 tokens in queue; passes `token_mgr.local_ip` to `BulkTokenGetter` |
 | `deleter.py` | `FastBulkDeleter` | `AdminTokenManager` | `_process_batch(emails)` → `[{email, success, [error]}]` per email |
-| `app.py` | Flask app | `--host`, `--port` | HTTP API service (entry point) |
+| `app.py` | Flask app | `--host`, `--port`, `--config`, `--local-ip` | HTTP API service (entry point) |
 
-`app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth.
+`app.py` is the entry point. All modules share a single `AdminTokenManager` instance for admin OAuth. `--config` selects this tenant's admin file (default `admin_token.json`); `--local-ip` overrides the file's `local_ip`.
 
 ### Get_Profile module structure
 
@@ -75,14 +86,15 @@ admin_token.json
 |---------|------|----------------|
 | `token` | `api.go` | HTTP client for Python API (`/tokens/next`, `/users/delete`) |
 | `token` | `exchange.go` | `ExchangeRefreshToken` — swap refresh_token → Loki access_token (2 retries on transient) |
-| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache per TokenInfo |
-| `api` | `client.go` | Loki API client, connection pooling, gzip |
+| `token` | `manager.go` | Token queue, dead notification, lazy access_token cache; token-exchange client binds to callout IP (`NewManagerWithLocalIP`) |
+| `api` | `client.go` | Loki API client, connection pooling, gzip; binds to callout IP (`NewClientWithLocalIP`) |
+| `netbind` | `netbind.go` | Builds `net.Dialer`/`DialContext` bound to a fixed local source IP (`net.Dialer.LocalAddr`) for per-tenant egress |
 | `progress` | `bitmap.go` | Line-indexed bitmap checkpoint (LoadOrCreate, atomic Set, SaveAtomic via tmp+rename, 10s auto-save) |
 | `worker` | `pool.go` | Worker pool, rate limiter (20K CPM), token queue mode, bitmap terminal-marking |
 | `reader` | `file.go` | Streaming email reader, per-line counter, bitmap skip; pushes via `pool.Submit` callback |
 | `writer` | `result.go` | Async buffered result writer |
 
-`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`.
+`main.go` wires everything — it is the only entry point. Flags: `--api` (default `http://localhost:5000`), `--emails`, `--result`, `--checkpoint` (default `<emails>.ckpt`), `--workers`, `--max-cpm`, `--local-ip` (callout IP for Loki + token-exchange traffic; the localhost API client stays unbound on loopback).
 
 ### email-gen module structure
 
@@ -103,7 +115,8 @@ Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để g
 ### Key design decisions
 
 - **Browser flow for tokens**: `token_getter.py` uses `curl_cffi` to impersonate a browser for Microsoft Teams OAuth. Do not replace with ROPC or Graph API.
-- **1 VPS = 1 admin**: First admin from `admin_token.json` is used.
+- **1 VPS = 1 admin**: First admin from `admin_token.json` is used. To run **two tenants on one VPS** (e.g. one IPv4 + one IPv6), run two process sets, each with its own `--config <file>` and `--local-ip <ip>`. See `DEPLOY_DUAL_TENANT.md`.
+- **Per-tenant callout IP (`local_ip`)**: Optional `local_ip` field (admin config) / `--local-ip` flag binds all *external* outbound traffic to a fixed VPS source IP. Python: `requests` via `source_ip.SourceAddressAdapter` (urllib3 `source_address`) and `curl_cffi` via the `interface` option; Go: `netbind` sets `net.Dialer.LocalAddr` on the Loki and token-exchange clients. The Go localhost API client (`token/api.go`) is deliberately **not** bound, so loopback traffic to the Python service is never forced onto a public IP. Binding applies to direct dials only (this deployment uses no external proxy).
 - **User prefix `bot_`**: All app-created users have `bot_` prefix in userPrincipalName. Startup cleanup lists and deletes all `bot_` users for crash recovery.
 - **Shared AdminTokenManager**: Single `AdminTokenManager` instance handles admin OAuth for all modules. Thread-safe, auto-refresh, tracks refresh_token rotation, saves to `admin_token.json`.
 - **Refresh tokens in queue, Go exchanges lazily**: Python browser flow returns the raw refresh_token (~24h TTL) — no Loki rescope on the Python side. Queue contains refresh_token + tenant_id; Go's `token.Manager.GetAccessToken` lazily exchanges to a Loki access_token (~1h TTL) on first use and re-exchanges when the cached access_token nears expiry, so one refresh_token yields many access_tokens over its 24h window. Exchange failures retry 2× with 1s backoff; permanent failures (invalid_grant) or 401/424/500-exhausted responses still trigger user deletion as before.

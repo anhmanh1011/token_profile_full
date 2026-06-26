@@ -23,6 +23,8 @@ from typing import Optional
 
 from curl_cffi import requests
 
+from source_ip import curl_interface
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKERS = 30
@@ -31,11 +33,21 @@ DEFAULT_WORKERS = 30
 class TeamOutLook:
     """Browser-flow login to Microsoft Teams to obtain refresh tokens."""
 
-    def __init__(self, email: str, password: str, proxy: Optional[str] = None):
+    def __init__(
+        self,
+        email: str,
+        password: str,
+        proxy: Optional[str] = None,
+        local_ip: Optional[str] = None,
+    ):
         self.mail = email
         self.pwd = password
         self.newpwd = self.pwd + "1"
-        self.session = requests.Session(impersonate="firefox135", timeout=60)
+        # interface = curl_cffi/libcurl source-IP binding for this tenant.
+        self.interface = curl_interface(local_ip)
+        self.session = requests.Session(
+            impersonate="firefox135", timeout=60, interface=self.interface
+        )
         self.data_proxy = None
         self.tenant_id = ""
 
@@ -58,7 +70,9 @@ class TeamOutLook:
         self.final_password: Optional[str] = None
 
     def clear_cookies(self) -> None:
-        self.session = requests.Session(impersonate="chrome131", timeout=60)
+        self.session = requests.Session(
+            impersonate="chrome131", timeout=60, interface=self.interface
+        )
         if self.data_proxy:
             self.session.proxies.update(self.data_proxy)
 
@@ -473,16 +487,19 @@ class BulkTokenGetter:
         users: list[dict],
         workers: int = DEFAULT_WORKERS,
         proxy: Optional[str] = None,
+        local_ip: Optional[str] = None,
     ):
         """
         Args:
             users: List of {"email": str, "password": str}
             workers: Number of concurrent threads
             proxy: Optional proxy string
+            local_ip: Optional outbound source IP (callout IP)
         """
         self.users = users
         self.workers = workers
         self.proxy = proxy
+        self.local_ip = local_ip
 
         # Results
         self.tokens: list[dict] = []
@@ -498,7 +515,9 @@ class BulkTokenGetter:
                 return
 
             try:
-                obj = TeamOutLook(user["email"], user["password"], self.proxy)
+                obj = TeamOutLook(
+                    user["email"], user["password"], self.proxy, self.local_ip
+                )
                 if obj.do_task():
                     with self.stats_lock:
                         self.success_count += 1

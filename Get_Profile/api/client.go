@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"io"
 	"linkedin_fetcher/models"
-	"net"
+	"linkedin_fetcher/netbind"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
@@ -26,20 +27,24 @@ type Client struct {
 
 // NewClient creates a new API client with connection pooling
 func NewClient(timeoutSeconds int) *Client {
-	return NewClientWithProxy(timeoutSeconds, "")
+	return NewClientWithLocalIP(timeoutSeconds, "")
 }
 
-// NewClientWithProxy creates a new API client with optional proxy support
-// proxyURL format: http://host:port, http://user:pass@host:port, socks5://host:port
-func NewClientWithProxy(timeoutSeconds int, proxyURL string) *Client {
+// NewClientWithLocalIP creates a Loki API client whose outbound connections are
+// bound to localIP (the tenant's callout IP). Pass "" to dial from the OS
+// default route. A malformed localIP degrades to an unbound dialer with a
+// logged error rather than failing startup.
+func NewClientWithLocalIP(timeoutSeconds int, localIP string) *Client {
 	timeout := time.Duration(timeoutSeconds) * time.Second
+
+	dial, err := netbind.DialContext(localIP, 5*time.Second, 30*time.Second)
+	if err != nil {
+		slog.Error("api: invalid local IP, falling back to default route (Loki traffic will use the default IP)", "err", err)
+	}
 
 	// Create transport with connection pooling
 	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           dial,
 		MaxIdleConns:          4000,
 		MaxIdleConnsPerHost:   3000,
 		MaxConnsPerHost:       3000,
@@ -47,13 +52,6 @@ func NewClientWithProxy(timeoutSeconds int, proxyURL string) *Client {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableKeepAlives:     false,
-	}
-
-	// Add proxy if specified
-	if proxyURL != "" {
-		if parsedURL, err := url.Parse(proxyURL); err == nil {
-			transport.Proxy = http.ProxyURL(parsedURL)
-		}
 	}
 
 	return &Client{
