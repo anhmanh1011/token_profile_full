@@ -11,6 +11,7 @@ import random
 import string
 import threading
 import time
+import uuid
 from typing import Optional
 
 import requests
@@ -26,6 +27,78 @@ DEFAULT_COUNT = 10000
 BATCH_SIZE = 20
 WORKERS = 2
 DELAY_BETWEEN_BATCHES = 1.5
+
+# License selection
+A1_STUDENTS_PART_NUMBER = "STANDARDWOFFPACK_STUDENT"  # Office 365 A1 for students
+LICENSE_ALIASES = {"a1-students": A1_STUDENTS_PART_NUMBER}
+
+
+def _is_guid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _eligible_skus(skus: list[dict]) -> list[dict]:
+    out = []
+    for sku in skus:
+        enabled = sku.get("prepaidUnits", {}).get("enabled", 0)
+        consumed = sku.get("consumedUnits", 0)
+        if enabled - consumed > 0:
+            out.append(sku)
+    return out
+
+
+def resolve_license_sku(skus: list[dict], preference: Optional[str]) -> Optional[str]:
+    """Resolve a license preference to a concrete skuId given subscribed SKUs.
+
+    Semantics:
+      - None / "" / "auto" / known alias ("a1-students"): prefer Office 365 A1
+        for students (part number STANDARDWOFFPACK_STUDENT); if it has no free
+        seat, fall back to the first SKU with a free seat (logged as a warning).
+      - raw GUID (skuId): use that exact skuId only if present with a free seat;
+        otherwise None (no cross-product fallback — pinning is intentional).
+      - any other string: treat as an exact skuPartNumber; use it if it has a
+        free seat, otherwise None.
+    Only SKUs with ``enabled - consumed > 0`` are eligible.
+    """
+    eligible = _eligible_skus(skus)
+    if not eligible:
+        return None
+
+    pref = (preference or "auto").strip()
+    is_auto = pref.lower() == "auto" or pref.lower() in LICENSE_ALIASES
+
+    if pref.lower() in LICENSE_ALIASES:
+        target_part = LICENSE_ALIASES[pref.lower()]
+    elif is_auto:
+        target_part = A1_STUDENTS_PART_NUMBER
+    elif _is_guid(pref):
+        for sku in eligible:
+            if sku.get("skuId") == pref:
+                return pref
+        logger.warning("Pinned license skuId %s has no free seat; not assigning", pref[:8])
+        return None
+    else:
+        target_part = pref  # treat as an exact skuPartNumber
+
+    for sku in eligible:
+        if sku.get("skuPartNumber") == target_part:
+            return sku.get("skuId")
+
+    if is_auto:
+        fallback = eligible[0].get("skuId")
+        logger.warning(
+            "License %s unavailable; falling back to first available SKU %s (%s)",
+            target_part, eligible[0].get("skuPartNumber"), (fallback or "")[:8],
+        )
+        return fallback
+
+    logger.warning("Pinned license part-number %s has no free seat; not assigning", target_part)
+    return None
+
 
 FIRST_NAMES = [
     "Nguyen", "Tran", "Le", "Pham", "Hoang", "Vu", "Vo", "Dang", "Bui", "Do",
