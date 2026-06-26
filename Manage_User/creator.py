@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
+# Target license to assign to created users: "Office 365 A1 for students".
+# Both identifiers are globally well-known and stable across tenants; we match
+# on skuPartNumber first and fall back to the skuId GUID.
+TARGET_LICENSE_SKU_PART_NUMBER = "STANDARDWOFFPACK_STUDENT"
+TARGET_LICENSE_SKU_ID = "314c4481-f395-4525-be8b-2ec4bb1e9d91"
+
 DEFAULT_COUNT = 10000
 BATCH_SIZE = 20
 WORKERS = 2
@@ -97,6 +103,14 @@ class BulkUserCreator:
         return self.token_mgr.get_token()
 
     def _get_available_license(self) -> Optional[str]:
+        """Return the skuId of "Office 365 A1 for students" if the tenant has a
+        free seat for it.
+
+        Matches the target SKU by skuPartNumber (falling back to the well-known
+        GUID). Returns None — meaning no license is assigned — when the target
+        SKU is absent or has no free seats. We never substitute a different SKU,
+        so created users only ever get the A1 for students license.
+        """
         token = self._get_token()
         if not token:
             return None
@@ -106,12 +120,35 @@ class BulkUserCreator:
             resp = self.token_mgr.session.get(
                 f"{GRAPH_URL}/subscribedSkus", headers=headers, timeout=30
             )
-            if resp.status_code == 200:
-                for sku in resp.json().get("value", []):
-                    enabled = sku.get("prepaidUnits", {}).get("enabled", 0)
-                    consumed = sku.get("consumedUnits", 0)
-                    if enabled - consumed > 0:
-                        return sku["skuId"]
+            if resp.status_code != 200:
+                logger.warning("Failed to list subscribedSkus: HTTP %d", resp.status_code)
+                return None
+
+            for sku in resp.json().get("value", []):
+                part = str(sku.get("skuPartNumber", ""))
+                sku_id = str(sku.get("skuId", ""))
+                is_target = (
+                    part.upper() == TARGET_LICENSE_SKU_PART_NUMBER
+                    or sku_id.lower() == TARGET_LICENSE_SKU_ID
+                )
+                if not is_target:
+                    continue
+
+                enabled = sku.get("prepaidUnits", {}).get("enabled", 0)
+                consumed = sku.get("consumedUnits", 0)
+                if enabled - consumed > 0:
+                    return sku["skuId"]
+
+                logger.warning(
+                    "Target license %s found but no free seats (enabled=%d, consumed=%d)",
+                    TARGET_LICENSE_SKU_PART_NUMBER, enabled, consumed,
+                )
+                return None
+
+            logger.warning(
+                "Target license %s (Office 365 A1 for students) not found in tenant subscribedSkus",
+                TARGET_LICENSE_SKU_PART_NUMBER,
+            )
         except requests.RequestException as e:
             logger.warning("Failed to get licenses: %s", e)
         return None
@@ -368,11 +405,14 @@ class BulkUserCreator:
             }
         logger.info("Authenticated successfully")
 
-        # Auto-detect license
+        # Resolve target license (Office 365 A1 for students) unless an explicit
+        # SKU was provided by the caller.
         if not self.license_sku:
             self.license_sku = self._get_available_license()
             if self.license_sku:
-                logger.info("Auto-detected license: %s", self.license_sku[:8])
+                logger.info("Using Office 365 A1 for students license: %s...", self.license_sku[:8])
+            else:
+                logger.warning("Office 365 A1 for students license unavailable — users will be created WITHOUT a license")
 
         # Generate users
         logger.info("Generating %d users...", self.count)
