@@ -12,6 +12,7 @@ Endpoints:
 import argparse
 import json
 import logging
+import os
 import queue
 import sys
 import threading
@@ -29,7 +30,24 @@ from producer import TokenProducer
 # ── Configuration ────────────────────────────────────────────────────────────
 
 CONFIG_FILE = Path(__file__).parent / "admin_token.json"
-LOG_FILE = Path(__file__).parent / "service.log"
+
+
+def _resolve_log_file() -> Path:
+    """Resolve the service log file path.
+
+    Honors the ``MANAGE_USER_LOG_FILE`` environment variable so each tenant
+    process can log to its own state dir (e.g.
+    ``/var/lib/token-tool/<id>/service.log``). Falls back to the module
+    directory's ``service.log`` when the variable is unset or blank, preserving
+    the previous single-tenant default.
+    """
+    override = os.environ.get("MANAGE_USER_LOG_FILE", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).parent / "service.log"
+
+
+LOG_FILE = _resolve_log_file()
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
