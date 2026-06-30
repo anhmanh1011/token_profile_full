@@ -10,6 +10,7 @@ import (
 	"io"
 	"linkedin_fetcher/api"
 	"linkedin_fetcher/config"
+	"linkedin_fetcher/metrics"
 	"linkedin_fetcher/progress"
 	"linkedin_fetcher/reader"
 	"linkedin_fetcher/token"
@@ -35,6 +36,7 @@ func main() {
 	maxCPM := flag.Int("max-cpm", 0, "Max requests per minute (0 = use default 20000)")
 	checkpointFile := flag.String("checkpoint", "", "Progress bitmap file (default: <emails>.ckpt)")
 	localIP := flag.String("local-ip", "", "Outbound source/callout IP for Loki + token-exchange traffic (this tenant's VPS IP)")
+	metricsFile := flag.String("metrics-file", "", "Path to write node_exporter textfile metrics (empty = disabled)")
 	flag.Parse()
 
 	// Generate timestamped filenames
@@ -212,6 +214,43 @@ func main() {
 	pool := worker.NewPool(cfg.NumWorkers, lokiClient, tokenManager, resultWriter, cfg.EmailBufferSize, cfg.MaxCPM, bitmap)
 	pool.StartProgressReporter(5*time.Second, totalEmails)
 	pool.Start()
+
+	// Periodic metrics writer (node_exporter textfile). Disabled when empty.
+	if *metricsFile != "" {
+		tenant := *instanceID
+		if tenant == "" {
+			tenant = "default"
+		}
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-fetchCtx.Done():
+					return
+				case <-ticker.C:
+					processed, successful, failed, exactMatch := pool.Stats()
+					tot, alive, dead, exhausted := tokenManager.FullStats()
+					snap := metrics.Snapshot{
+						Processed:   processed,
+						Successful:  successful,
+						Failed:      failed,
+						ExactMatch:  exactMatch,
+						TotalTokens: int64(tot),
+						Alive:       int64(alive),
+						Dead:        int64(dead),
+						Exhausted:   int64(exhausted),
+						Done:        bitmap.Done(),
+						TotalLines:  bitmap.TotalLines(),
+					}
+					if err := metrics.Write(*metricsFile, tenant, snap); err != nil {
+						log.Printf("[METRICS] write error: %v", err)
+					}
+				}
+			}
+		}()
+		log.Printf("[METRICS] Writing textfile metrics to %s every 15s (tenant=%s)", *metricsFile, tenant)
+	}
 
 	// Set up graceful shutdown
 	sigChan := make(chan os.Signal, 1)
