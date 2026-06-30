@@ -1,5 +1,7 @@
 """Unit tests for license resolution (pure, no network)."""
-from creator import resolve_license_sku, A1_STUDENTS_PART_NUMBER
+from unittest.mock import MagicMock
+
+from creator import resolve_license_sku, A1_STUDENTS_PART_NUMBER, BulkUserCreator
 
 A1_ID = "314c4481-f395-4525-be8b-2ec4bb1e9d91"
 E3_ID = "05e9a617-0261-4cee-bb44-138d3ef5d965"
@@ -61,12 +63,28 @@ def test_explicit_part_number_no_fallback_when_absent():
     assert resolve_license_sku(skus, "ENTERPRISEPACK") is None
 
 
+def test_explicit_part_number_returns_sku_id_when_available():
+    skus = [_sku(E3_ID, "ENTERPRISEPACK", 10, 0)]
+    assert resolve_license_sku(skus, "ENTERPRISEPACK") == E3_ID
+
+
+def test_alias_case_insensitive():
+    skus = [_sku(A1_ID, A1_STUDENTS_PART_NUMBER, 5, 0)]
+    assert resolve_license_sku(skus, "A1-STUDENTS") == A1_ID
+
+
+def test_explicit_guid_uppercase_normalised():
+    skus = [_sku(E3_ID, "ENTERPRISEPACK", 10, 0)]
+    assert resolve_license_sku(skus, E3_ID.upper()) == E3_ID
+
+
+def test_blank_preference_behaves_like_auto():
+    skus = [_sku(A1_ID, A1_STUDENTS_PART_NUMBER, 5, 0)]
+    assert resolve_license_sku(skus, "   ") == A1_ID
+
+
 def test_empty_sku_list_returns_none():
     assert resolve_license_sku([], "auto") is None
-
-
-from unittest.mock import MagicMock
-from creator import BulkUserCreator
 
 
 def _creator(usage_location="US", license_sku=None):

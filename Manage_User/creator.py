@@ -68,7 +68,9 @@ def resolve_license_sku(skus: list[dict], preference: Optional[str]) -> Optional
     if not eligible:
         return None
 
-    pref = (preference or "auto").strip()
+    # Blank/whitespace-only preference means "auto"; never let it fall through
+    # to an empty exact part-number match.
+    pref = (preference or "").strip() or "auto"
     is_auto = pref.lower() == "auto" or pref.lower() in LICENSE_ALIASES
 
     if pref.lower() in LICENSE_ALIASES:
@@ -76,10 +78,17 @@ def resolve_license_sku(skus: list[dict], preference: Optional[str]) -> Optional
     elif is_auto:
         target_part = A1_STUDENTS_PART_NUMBER
     elif _is_guid(pref):
+        # Graph returns lowercase canonical GUIDs; normalise so an operator who
+        # types an uppercase skuId still matches.
+        pref = str(uuid.UUID(pref))
         for sku in eligible:
             if sku.get("skuId") == pref:
                 return pref
-        logger.warning("Pinned license skuId %s has no free seat; not assigning", pref[:8])
+        subscribed = any(sku.get("skuId") == pref for sku in skus)
+        if subscribed:
+            logger.warning("Pinned license skuId %s is subscribed but has no free seat; not assigning", pref[:8])
+        else:
+            logger.warning("Pinned license skuId %s is not subscribed; not assigning", pref[:8])
         return None
     else:
         target_part = pref  # treat as an exact skuPartNumber

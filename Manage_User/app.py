@@ -9,6 +9,7 @@ Endpoints:
     POST /users/delete   — Delete a list of users by email
     GET  /status         — Queue and producer stats
 """
+import argparse
 import json
 import logging
 import queue
@@ -319,9 +320,7 @@ def start_service(
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 
-def build_arg_parser() -> "argparse.ArgumentParser":
-    import argparse
-
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage_User API Service")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
