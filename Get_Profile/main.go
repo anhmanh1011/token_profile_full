@@ -221,31 +221,35 @@ func main() {
 		if tenant == "" {
 			tenant = "default"
 		}
+		writeSnapshot := func() {
+			processed, successful, failed, exactMatch := pool.Stats()
+			tot, alive, dead, exhausted := tokenManager.FullStats()
+			snap := metrics.Snapshot{
+				Processed:   processed,
+				Successful:  successful,
+				Failed:      failed,
+				ExactMatch:  exactMatch,
+				TotalTokens: int64(tot),
+				Alive:       int64(alive),
+				Dead:        int64(dead),
+				Exhausted:   int64(exhausted),
+				Done:        bitmap.Done(),
+				TotalLines:  bitmap.TotalLines(),
+			}
+			if err := metrics.Write(*metricsFile, tenant, snap); err != nil {
+				log.Printf("[METRICS] write error: %v", err)
+			}
+		}
 		go func() {
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-fetchCtx.Done():
+					writeSnapshot() // final flush so the file reflects the true end state
 					return
 				case <-ticker.C:
-					processed, successful, failed, exactMatch := pool.Stats()
-					tot, alive, dead, exhausted := tokenManager.FullStats()
-					snap := metrics.Snapshot{
-						Processed:   processed,
-						Successful:  successful,
-						Failed:      failed,
-						ExactMatch:  exactMatch,
-						TotalTokens: int64(tot),
-						Alive:       int64(alive),
-						Dead:        int64(dead),
-						Exhausted:   int64(exhausted),
-						Done:        bitmap.Done(),
-						TotalLines:  bitmap.TotalLines(),
-					}
-					if err := metrics.Write(*metricsFile, tenant, snap); err != nil {
-						log.Printf("[METRICS] write error: %v", err)
-					}
+					writeSnapshot()
 				}
 			}
 		}()
