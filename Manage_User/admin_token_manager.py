@@ -25,12 +25,15 @@ CONFIG_FILE = Path(__file__).parent / "admin_token.json"
 class AdminTokenManager:
     """Thread-safe admin OAuth token manager with auto-refresh and rotation tracking."""
 
-    def __init__(self, admin: dict):
+    def __init__(self, admin: dict, config_path: Optional[Path] = None):
         self.tenant_id = admin["tenant_id"]
         self.refresh_token = admin["refresh_token"]
         self.domain = admin.get("domain", "")
         # Per-tenant outbound source IP (callout IP). None = OS default route.
         self.local_ip = parse_local_ip(admin.get("local_ip"))
+        # Persist rotated refresh_token back to THIS tenant's --config file
+        # (e.g. /etc/token-tool/admin_token.<id>.json), not the shared default.
+        self.config_path = Path(config_path) if config_path else CONFIG_FILE
 
         self._access_token: Optional[str] = None
         self._token_expires: float = 0
@@ -101,19 +104,19 @@ class AdminTokenManager:
         return self._refresh_token_updated
 
     def save_if_updated(self) -> None:
-        """Save updated refresh_token to admin_token.json if rotated."""
+        """Save updated refresh_token to this tenant's config file if rotated."""
         if not self._refresh_token_updated:
             return
 
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 admins = json.load(f)
 
             # Update first admin's refresh_token
             if admins:
                 admins[0]["refresh_token"] = self.refresh_token
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(admins, f, indent=4, ensure_ascii=False)
-                logger.info("Saved updated refresh_token to %s", CONFIG_FILE.name)
+                logger.info("Saved updated refresh_token to %s", self.config_path.name)
         except Exception as e:
             logger.error("Failed to save refresh_token: %s", e)

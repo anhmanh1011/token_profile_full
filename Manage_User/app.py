@@ -272,7 +272,7 @@ def start_service(
         _admin_config = _load_admin_config(config_file)
         if local_ip:
             _admin_config["local_ip"] = local_ip
-        _token_mgr = AdminTokenManager(_admin_config)
+        _token_mgr = AdminTokenManager(_admin_config, config_path=config_file)
         logger.info(
             "Loaded admin config: domain=%s", _admin_config.get("domain", "?")
         )
