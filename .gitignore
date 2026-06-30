@@ -23,3 +23,14 @@ email-gen/*.gz
 # Claude Code local config
 .claude/
 *.bak
+
+# --- Ansible deploy (Plan 2/3) ---
+# Mật khẩu vault — KHÔNG commit
+.vault-pass
+deploy/.vault-pass
+# Vault đã mã hóa chứa secret thật — mặc định KHÔNG commit để tránh rò rỉ.
+# (Nếu team muốn commit bản ĐÃ MÃ HÓA, xóa dòng dưới và commit có chủ đích.)
+deploy/group_vars/all/vault.yml
+# Retry files
+*.retry
+deploy/*.retry

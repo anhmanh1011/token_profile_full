@@ -1,0 +1,45 @@
+---
+# deploy/group_vars/all/vault.yml.example
+# ==========================================================================
+# MẪU plaintext của secret per-tenant. KHÔNG dùng trực tiếp, KHÔNG chứa secret thật.
+# tenants.yml tham chiếu: admin.refresh_token={{ vault_<id>_refresh }},
+#                         admin.tenant_id   ={{ vault_<id>_tenant_id }}.
+# Mỗi tenant cần đúng 2 biến: vault_<id>_refresh, vault_<id>_tenant_id.
+# (Plan 3) ops node cần thêm: vault_grafana_admin_password.
+#
+# TẠO file vault thật (mã hóa) — chọn 1 trong 2 cách:
+#
+#   Cách A (tạo trực tiếp, mở editor):
+#     ansible-vault create group_vars/all/vault.yml
+#     # dán nội dung theo mẫu dưới, thay GIÁ TRỊ THẬT, lưu & thoát.
+#
+#   Cách B (từ file này):
+#     cp group_vars/all/vault.yml.example /tmp/vault.plain.yml
+#     # sửa /tmp/vault.plain.yml với giá trị thật
+#     ansible-vault encrypt --output group_vars/all/vault.yml /tmp/vault.plain.yml
+#     rm -f /tmp/vault.plain.yml          # XÓA bản plaintext ngay
+#
+# Mật khẩu vault: lưu vào deploy/.vault-pass (chmod 600, ĐÃ gitignore) hoặc
+# nhập tay với --ask-vault-pass. Sửa secret sau này: ansible-vault edit group_vars/all/vault.yml
+# ==========================================================================
+
+# --- vps1 ---
+vault_t1_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant1...AAA"
+vault_t1_tenant_id: "11111111-1111-1111-1111-111111111111"
+vault_t2_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant2...AAA"
+vault_t2_tenant_id: "22222222-2222-2222-2222-222222222222"
+
+# --- vps2 ---
+vault_t3_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant3...AAA"
+vault_t3_tenant_id: "33333333-3333-3333-3333-333333333333"
+vault_t4_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant4...AAA"
+vault_t4_tenant_id: "44444444-4444-4444-4444-444444444444"
+
+# --- vps3 ---
+vault_t5_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant5...AAA"
+vault_t5_tenant_id: "55555555-5555-5555-5555-555555555555"
+vault_t6_refresh:   "0.AXEAReplaceWithRealRefreshTokenForTenant6...AAA"
+vault_t6_tenant_id: "66666666-6666-6666-6666-666666666666"
+
+# --- ops node (Plan 3 monitoring stack) ---
+vault_grafana_admin_password: "change-me-strong-grafana-admin-pass"

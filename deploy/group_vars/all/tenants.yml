@@ -1,0 +1,138 @@
+---
+# deploy/group_vars/all/tenants.yml
+# ==========================================================================
+# NGUỒN CẤU HÌNH DUY NHẤT cho toàn bộ tenant trên 3 app VPS.
+# Thêm/sửa/bớt tenant = sửa file này rồi `make provision` (idempotent).
+#
+# - Secret (refresh_token, tenant_id) KHÔNG để ở đây: tham chiếu biến vault
+#   trong group_vars/all/vault.yml (ansible-vault). Xem vault.yml.example.
+# - Map tenant -> host qua field `vps` (vps1|vps2|vps3); playbook lọc
+#   `when: item.vps == inventory_hostname`.
+# - IP trong app_vps/ops_host là MẪU (dải tài liệu RFC 5737 / 2001:db8::/32);
+#   THAY bằng IP/DNS thật. local_ip mỗi tenant = callout IP egress riêng.
+# ==========================================================================
+
+# Registry host (nguồn IP duy nhất; inventory/hosts.yml template ansible_host từ đây).
+app_vps:
+  vps1: { ansible_host: 203.0.113.10 }
+  vps2: { ansible_host: 198.51.100.10 }
+  vps3: { ansible_host: 192.0.2.10 }
+
+ops_host:
+  ops1: { ansible_host: 203.0.113.200 }
+
+# Mặc định toàn cục — mỗi tenant có thể override.
+tenant_defaults:
+  license_sku: a1-students        # alias -> STANDARDWOFFPACK_STUDENT (Office 365 A1 for students)
+  usage_location: US
+  workers: 400
+  max_cpm: 20000
+
+tenants:
+  # ---- VPS1: t1 (IPv4) + t2 (IPv4) ---------------------------------------
+  - id: t1
+    vps: vps1
+    local_ip: 203.0.113.10
+    manageuser_port: 5000
+    admin:
+      tenant_id: "{{ vault_t1_tenant_id }}"
+      username: admin@tenant1.example
+      domain: tenant1.example
+      refresh_token: "{{ vault_t1_refresh }}"
+    license_sku: a1-students
+    usage_location: US
+    emailgen:
+      domains: [tenant1.example, alumni.tenant1.example]
+      usernames: [john.doe, jane.smith, alex.lee]
+    workers: 400
+    max_cpm: 20000
+
+  - id: t2
+    vps: vps1
+    local_ip: 203.0.113.11
+    manageuser_port: 5001
+    admin:
+      tenant_id: "{{ vault_t2_tenant_id }}"
+      username: admin@tenant2.example
+      domain: tenant2.example
+      refresh_token: "{{ vault_t2_refresh }}"
+    license_sku: a1-students
+    usage_location: US
+    emailgen:
+      domains: [tenant2.example]
+      usernames: [mary.jones, peter.pan, sara.kim, tom.ford]
+    workers: 400
+    max_cpm: 20000
+
+  # ---- VPS2: t3 (IPv4, usernames_file) + t4 (IPv6, license GUID override) -
+  - id: t3
+    vps: vps2
+    local_ip: 198.51.100.10
+    manageuser_port: 5000
+    admin:
+      tenant_id: "{{ vault_t3_tenant_id }}"
+      username: admin@tenant3.example
+      domain: tenant3.example
+      refresh_token: "{{ vault_t3_refresh }}"
+    license_sku: a1-students
+    usage_location: US
+    emailgen:
+      domains: [tenant3.example]
+      # Dùng file commit trong repo thay vì inline (role tenant copy lên VPS).
+      usernames_file: files/usernames/common.txt
+    workers: 400
+    max_cpm: 20000
+
+  - id: t4
+    vps: vps2
+    local_ip: "2001:db8:51::10"      # IPv6 callout IP (chuỗi -> phải quote)
+    manageuser_port: 5001
+    admin:
+      tenant_id: "{{ vault_t4_tenant_id }}"
+      username: admin@tenant4.example
+      domain: tenant4.example
+      refresh_token: "{{ vault_t4_refresh }}"
+    # Override license: dùng skuPartNumber tường minh (khác alias mặc định).
+    license_sku: ENTERPRISEPACK
+    usage_location: GB               # override usage_location ví dụ
+    emailgen:
+      domains: [tenant4.example, study.tenant4.example]
+      usernames: [li.wei, chen.yu]
+    workers: 400
+    max_cpm: 20000
+
+  # ---- VPS3: t5 (IPv4, workers/max_cpm override) + t6 (IPv6, partnumber sku)
+  - id: t5
+    vps: vps3
+    local_ip: 192.0.2.10
+    manageuser_port: 5000
+    admin:
+      tenant_id: "{{ vault_t5_tenant_id }}"
+      username: admin@tenant5.example
+      domain: tenant5.example
+      refresh_token: "{{ vault_t5_refresh }}"
+    license_sku: a1-students
+    usage_location: US
+    emailgen:
+      domains: [tenant5.example]
+      usernames: [omar.aziz, nadia.h]
+    workers: 300                     # override: VPS yếu hơn
+    max_cpm: 15000                   # override
+
+  - id: t6
+    vps: vps3
+    local_ip: "2001:db8:2::10"       # IPv6
+    manageuser_port: 5001
+    admin:
+      tenant_id: "{{ vault_t6_tenant_id }}"
+      username: admin@tenant6.example
+      domain: tenant6.example
+      refresh_token: "{{ vault_t6_refresh }}"
+    # Override license bằng skuPartNumber tường minh.
+    license_sku: STANDARDWOFFPACK_STUDENT
+    usage_location: US
+    emailgen:
+      domains: [tenant6.example]
+      usernames: [ivan.petrov, olga.k, dmitry.s]
+    workers: 400
+    max_cpm: 20000

@@ -1,0 +1,10 @@
+---
+# deploy/requirements.yml — collection Ansible cần cài trên control node.
+# Cài: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: community.general    # stdout_callback=yaml + ufw + nhiều module tiện ích
+    version: ">=9.0.0"
+  - name: community.docker     # (Plan 3) quản lý docker compose stack giám sát trên ops node
+    version: ">=3.10.0"
+  - name: ansible.posix        # synchronize, sysctl... dùng ở role app/observability
+    version: ">=1.5.0"
