@@ -245,6 +245,8 @@ def start_service(
     port: int = 5000,
     config_file: Path = CONFIG_FILE,
     local_ip: Optional[str] = None,
+    license_sku: str = "a1-students",
+    usage_location: str = "US",
 ) -> None:
     """Initialise and start the API service.
 
@@ -294,7 +296,10 @@ def start_service(
 
     # Step 3: Start token producer and wait for queue to fill
     logger.info("Starting TokenProducer background thread...")
-    _producer = TokenProducer(_token_mgr, token_queue)
+    _producer = TokenProducer(
+        _token_mgr, token_queue,
+        license_sku=license_sku, usage_location=usage_location,
+    )
     _producer.start()
 
     # Step 4: Wait until queue has >= MIN_QUEUE_SIZE tokens
@@ -313,7 +318,8 @@ def start_service(
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+
+def build_arg_parser() -> "argparse.ArgumentParser":
     import argparse
 
     parser = argparse.ArgumentParser(description="Manage_User API Service")
@@ -329,10 +335,26 @@ if __name__ == "__main__":
         default=None,
         help="Outbound source/callout IP for this tenant (overrides config local_ip)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--license-sku",
+        default="a1-students",
+        help="License preference: alias (a1-students), skuPartNumber, GUID, or 'auto'",
+    )
+    parser.add_argument(
+        "--usage-location",
+        default="US",
+        help="Two-letter usageLocation for created users (default US)",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
     start_service(
         host=args.host,
         port=args.port,
         config_file=Path(args.config),
         local_ip=args.local_ip,
+        license_sku=args.license_sku,
+        usage_location=args.usage_location,
     )
