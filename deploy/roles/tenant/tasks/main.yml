@@ -1,0 +1,171 @@
+---
+# roles/tenant/tasks/main.yml
+# Render per-tenant config + units and start the tenant's process pair.
+# Runs only the tenants whose `vps` matches this host (inventory_hostname),
+# so naming inventory hosts vps1/vps2/vps3 to match tenants[].vps is required.
+
+- name: Compute tenants assigned to this host
+  ansible.builtin.set_fact:
+    host_tenants: "{{ tenants | selectattr('vps', 'equalto', inventory_hostname) | list }}"
+
+- name: Ensure per-tenant state directory exists
+  ansible.builtin.file:
+    path: "/var/lib/token-tool/{{ item.id }}"
+    state: directory
+    owner: tokentool
+    group: tokentool
+    mode: "0750"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Ensure per-tenant email-gen inputs directory exists
+  ansible.builtin.file:
+    path: "/var/lib/token-tool/{{ item.id }}/inputs"
+    state: directory
+    owner: tokentool
+    group: tokentool
+    mode: "0750"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Render admin_token.<id>.json (contains secrets)
+  ansible.builtin.template:
+    src: admin_token.json.j2
+    dest: "/etc/token-tool/admin_token.{{ item.id }}.json"
+    owner: tokentool
+    group: tokentool
+    mode: "0600"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  no_log: true
+  register: admin_render
+
+- name: Render <id>.env
+  ansible.builtin.template:
+    src: tenant.env.j2
+    dest: "/etc/token-tool/{{ item.id }}.env"
+    owner: root
+    group: tokentool
+    mode: "0640"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  register: env_render
+
+- name: Render email-gen inputs/domains.txt
+  ansible.builtin.template:
+    src: domains.txt.j2
+    dest: "/var/lib/token-tool/{{ item.id }}/inputs/domains.txt"
+    owner: tokentool
+    group: tokentool
+    mode: "0640"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  register: domains_render
+
+- name: Render email-gen inputs/usernames.txt
+  ansible.builtin.template:
+    src: usernames.txt.j2
+    dest: "/var/lib/token-tool/{{ item.id }}/inputs/usernames.txt"
+    owner: tokentool
+    group: tokentool
+    mode: "0640"
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  register: usernames_render
+
+- name: Install systemd unit templates
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - manageuser@.service
+    - getprofile@.service
+    - emailgen@.service
+  notify: Reload systemd
+  register: unit_render
+
+- name: Apply pending daemon-reload before touching units
+  ansible.builtin.meta: flush_handlers
+
+- name: Compute tenant ids whose email-gen inputs changed
+  ansible.builtin.set_fact:
+    emailgen_changed_ids: >-
+      {{ (domains_render.results | selectattr('changed') | map(attribute='item.id') | list)
+         + (usernames_render.results | selectattr('changed') | map(attribute='item.id') | list)
+         | unique }}
+
+- name: Compute tenant ids whose env changed
+  ansible.builtin.set_fact:
+    env_changed_ids: "{{ env_render.results | selectattr('changed') | map(attribute='item.id') | list }}"
+
+- name: Compute tenant ids whose admin token changed
+  ansible.builtin.set_fact:
+    admin_changed_ids: "{{ admin_render.results | selectattr('changed') | map(attribute='item.id') | list }}"
+
+- name: Compute restart sets
+  ansible.builtin.set_fact:
+    manageuser_restart_ids: "{{ (env_changed_ids + admin_changed_ids) | unique }}"
+    getprofile_restart_ids: "{{ env_changed_ids }}"
+
+- name: Enable + start emailgen@<id> (generate emails.txt)
+  ansible.builtin.systemd_service:
+    name: "emailgen@{{ item.id }}.service"
+    enabled: true
+    state: started
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Regenerate emails.txt when email-gen inputs changed
+  ansible.builtin.systemd_service:
+    name: "emailgen@{{ item.id }}.service"
+    state: restarted
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: item.id in emailgen_changed_ids
+
+- name: Enable + start manageuser@<id>
+  ansible.builtin.systemd_service:
+    name: "manageuser@{{ item.id }}.service"
+    enabled: true
+    state: started
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Restart manageuser@<id> when its env or admin token changed
+  ansible.builtin.systemd_service:
+    name: "manageuser@{{ item.id }}.service"
+    state: restarted
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: item.id in manageuser_restart_ids
+
+- name: Enable + start getprofile@<id>
+  ansible.builtin.systemd_service:
+    name: "getprofile@{{ item.id }}.service"
+    enabled: true
+    state: started
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Restart getprofile@<id> when its env changed
+  ansible.builtin.systemd_service:
+    name: "getprofile@{{ item.id }}.service"
+    state: restarted
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: item.id in getprofile_restart_ids

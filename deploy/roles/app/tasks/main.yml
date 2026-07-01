@@ -1,0 +1,172 @@
+---
+# ── Guard: confirm the control-node source root really is the repo root ────────
+- name: Probe the resolved source root for a known repo file
+  delegate_to: localhost
+  become: false
+  run_once: true
+  ansible.builtin.stat:
+    path: "{{ token_tool_src_dir }}/Get_Profile/go.mod"
+  register: repo_root_probe
+
+- name: Fail fast if the resolved source root is wrong
+  run_once: true
+  ansible.builtin.assert:
+    that:
+      - repo_root_probe.stat.exists
+    fail_msg: >-
+      token_tool_src_dir={{ token_tool_src_dir }} does not look like the repo
+      root (Get_Profile/go.mod missing). Fix the playbook layout before syncing.
+    quiet: true
+
+# ── Sync repo → /opt/token-tool (ALLOWLIST: only the three app trees) ──────────
+# archive:true gives -rlptgoD; --no-owner/--no-group strip -o/-g so the control
+# node's uid is never propagated (kills the ownership churn that breaks
+# idempotence). delete:false so toolchain caches (.cargo/.rustup/go/.cache) and
+# the venv are never wiped. become:false (override the play) + --rsync-path so the
+# REMOTE rsync runs as root via passwordless sudo and can write the tokentool dir.
+- name: Sync application code to the app VPS (allowlist, clean trees only)
+  become: false
+  ansible.posix.synchronize:
+    src: "{{ token_tool_src_dir }}/"
+    dest: "{{ token_tool_code_dir }}/"
+    archive: true
+    delete: false
+    rsync_opts:
+      - "--rsync-path=sudo rsync"
+      - "--no-owner"
+      - "--no-group"
+      # build artifacts / runtime / caches — listed BEFORE the allowlist so they win
+      - "--exclude=/Manage_User/.venv"
+      - "--exclude=/Manage_User/service.log"
+      - "--exclude=/Manage_User/admin_token*.json"
+      - "--exclude=/Get_Profile/get_profile"
+      - "--exclude=/Get_Profile/*.exe"
+      - "--exclude=/email-gen/target"
+      - "--exclude=**/__pycache__/"
+      - "--exclude=*.pyc"
+      - "--exclude=*.log"
+      - "--exclude=*.ckpt"
+      - "--exclude=*.gz"
+      # allowlist: only these three trees are transferred
+      - "--include=/Manage_User/***"
+      - "--include=/Get_Profile/***"
+      - "--include=/email-gen/***"
+      # everything else at the repo root (aa.txt, token-api/, deploy/, .git/, …) is refused
+      - "--exclude=*"
+  register: code_sync
+  notify: Reload systemd
+
+- name: Normalise ownership of the synced application subdirs to the service user
+  ansible.builtin.file:
+    path: "{{ token_tool_code_dir }}/{{ item }}"
+    state: directory
+    owner: "{{ token_tool_user }}"
+    group: "{{ token_tool_group }}"
+    recurse: true
+  loop: "{{ token_tool_synced_subdirs }}"
+  when: code_sync.changed
+
+# ── Defence in depth: the allowlist is fail-closed, but assert no secret leaked ─
+- name: Scan the synced tree for secret-shaped files
+  ansible.builtin.find:
+    paths: "{{ token_tool_code_dir }}"
+    patterns:
+      - "admin_token*.json"
+      - "*.env"
+      - "*.pem"
+      - "*.key"
+      - "*.p12"
+      - "id_rsa*"
+      - "vault*"
+    recurse: true
+    file_type: file
+  register: leaked_secrets
+
+- name: Fail if any secret-shaped file is present under the code dir
+  ansible.builtin.assert:
+    that:
+      - leaked_secrets.matched == 0
+    fail_msg: >-
+      Secret-shaped files found under {{ token_tool_code_dir }}:
+      {{ leaked_secrets.files | map(attribute='path') | list }}.
+      The allowlist sync must not transfer these — clean the control-node tree.
+    quiet: true
+
+# ── Manage_User: virtualenv + dependencies ────────────────────────────────────
+- name: Create the Manage_User virtualenv
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ manageuser_venv }}"
+    creates: "{{ manageuser_venv }}/bin/python"
+  register: venv_created
+
+- name: Install Manage_User Python dependencies
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.pip:
+    requirements: "{{ manageuser_dir }}/requirements.txt"
+    virtualenv: "{{ manageuser_venv }}"
+    state: present
+  register: pip_install
+  when: code_sync.changed or venv_created.changed
+  notify: Reload systemd
+
+# ── Get_Profile: Go build (only when source changed or binary missing) ────────
+- name: Stat the Get_Profile binary
+  ansible.builtin.stat:
+    path: "{{ getprofile_bin }}"
+  register: getprofile_bin_stat
+
+- name: Build the Get_Profile Go binary
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.command:
+    cmd: "{{ go_install_root }}/bin/go build -o get_profile ."
+    chdir: "{{ getprofile_dir }}"
+  environment:
+    HOME: "{{ token_tool_home }}"
+    PATH: "{{ go_install_root }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    GOCACHE: "{{ token_tool_home }}/.cache/go-build"
+    GOPATH: "{{ token_tool_home }}/go"
+  register: getprofile_build
+  changed_when: getprofile_build.rc == 0
+  when: code_sync.changed or not getprofile_bin_stat.stat.exists
+  notify: Reload systemd
+
+# ── email-gen: Rust release build (only when source changed or binary missing) ─
+- name: Stat the email-gen binary
+  ansible.builtin.stat:
+    path: "{{ emailgen_bin }}"
+  register: emailgen_bin_stat
+
+- name: Build the email-gen Rust binary (release)
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.command:
+    cmd: "{{ cargo_home }}/bin/cargo build --release"
+    chdir: "{{ emailgen_dir }}"
+  environment:
+    HOME: "{{ token_tool_home }}"
+    PATH: "{{ cargo_home }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    CARGO_HOME: "{{ cargo_home }}"
+    RUSTUP_HOME: "{{ rustup_home }}"
+  register: emailgen_build
+  changed_when: emailgen_build.rc == 0
+  when: code_sync.changed or not emailgen_bin_stat.stat.exists
+  notify: Reload systemd
+
+# ── Export a play-scoped flag for the tenant role's per-instance restart ───────
+# The tenant role (deploy.yml rolling path) reads token_tool_code_changed and
+# restarts ONLY this host's own manageuser@<id>/getprofile@<id> instances.
+# emailgen@<id> is intentionally never auto-restarted (regenerating emails.txt
+# changes its SHA-256 fingerprint and invalidates the Get_Profile bitmap).
+- name: Record that application code or binaries changed (consumed by tenant role)
+  ansible.builtin.set_fact:
+    token_tool_code_changed: true
+  when: >-
+    code_sync.changed
+    or (venv_created is defined and venv_created.changed)
+    or (pip_install is defined and pip_install.changed)
+    or (getprofile_build is defined and getprofile_build.changed)
+    or (emailgen_build is defined and emailgen_build.changed)

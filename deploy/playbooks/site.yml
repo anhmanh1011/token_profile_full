@@ -1,0 +1,11 @@
+---
+# deploy/playbooks/site.yml — convergence of the app VPS fleet (Plan 2 scope).
+# Plan 3 extends this with the `observability` role on app_vps and a second play
+# for `hosts: ops` running the `monitoring` role (see playbooks/monitoring.yml).
+- name: App VPS — base, build, per-tenant config + services
+  hosts: app_vps
+  become: true
+  roles:
+    - { role: common, tags: [common, base] }
+    - { role: app, tags: [app, build] }
+    - { role: tenant, tags: [tenant] }

@@ -1,0 +1,28 @@
+[Unit]
+Description=Get_Profile batch fetcher (tenant %i)
+After=network-online.target manageuser@%i.service emailgen@%i.service
+Wants=network-online.target manageuser@%i.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tokentool
+Group=tokentool
+EnvironmentFile=/etc/token-tool/%i.env
+WorkingDirectory=/var/lib/token-tool/%i
+ExecStart=/opt/token-tool/Get_Profile/get_profile \
+  --api ${API_ADDR} \
+  --local-ip ${LOCAL_IP} \
+  --emails ${EMAILS} \
+  --result ${RESULT} \
+  --checkpoint ${CHECKPOINT} \
+  --workers ${WORKERS} \
+  --max-cpm ${MAX_CPM} \
+  --id %i \
+  --metrics-file ${METRICS_FILE}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

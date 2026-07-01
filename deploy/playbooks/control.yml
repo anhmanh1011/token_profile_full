@@ -1,0 +1,110 @@
+---
+# deploy/playbooks/control.yml — operate tenant service pairs.
+# Usage:
+#   ansible-playbook playbooks/control.yml -e action=start
+#   ansible-playbook playbooks/control.yml -e "action=restart tenant=t1"
+#   ansible-playbook playbooks/control.yml -e action=status
+#   ansible-playbook playbooks/control.yml -e "action=logs tenant=t1"
+- name: Control tenant service pairs
+  hosts: app_vps
+  become: true
+  gather_facts: false
+  vars:
+    action: status
+    tenant: all
+  tasks:
+    - name: Validate action
+      ansible.builtin.assert:
+        that:
+          - action in ['start', 'stop', 'restart', 'status', 'logs']
+        fail_msg: "action must be one of start|stop|restart|status|logs (got '{{ action }}')"
+
+    - name: Compute target tenants on this host
+      ansible.builtin.set_fact:
+        target_tenants: >-
+          {{ (tenants | selectattr('vps', 'equalto', inventory_hostname)
+                      | selectattr('id', 'equalto', tenant) | list)
+             if tenant != 'all'
+             else (tenants | selectattr('vps', 'equalto', inventory_hostname) | list) }}
+
+    # --- lifecycle path (start/stop/restart) ---
+    - name: "{{ action | capitalize }} manageuser@<id>"
+      ansible.builtin.systemd_service:
+        name: "manageuser@{{ item.id }}.service"
+        state: "{{ {'start': 'started', 'stop': 'stopped', 'restart': 'restarted'}[action] }}"
+      loop: "{{ target_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+      when: action in ['start', 'stop', 'restart']
+
+    - name: "{{ action | capitalize }} getprofile@<id>"
+      ansible.builtin.systemd_service:
+        name: "getprofile@{{ item.id }}.service"
+        state: "{{ {'start': 'started', 'stop': 'stopped', 'restart': 'restarted'}[action] }}"
+      loop: "{{ target_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+      when: action in ['start', 'stop', 'restart']
+
+    # --- status path ---
+    - name: Query systemd is-active for each unit in the pair
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ item.0 }}@{{ item.1.id }}.service"
+      loop: "{{ ['manageuser', 'getprofile'] | product(target_tenants) | list }}"
+      loop_control:
+        label: "{{ item.0 }}@{{ item.1.id }}"
+      register: active_check
+      changed_when: false
+      failed_when: false
+      when: action == 'status'
+
+    - name: Query Manage_User /status HTTP endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item.manageuser_port }}/status"
+        method: GET
+        return_content: true
+        status_code: [200, 202]
+      loop: "{{ target_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: status_http
+      failed_when: false
+      when: action == 'status'
+
+    - name: Print systemd status report
+      ansible.builtin.debug:
+        msg: "{{ item.cmd | join(' ') }} -> {{ item.stdout }}"
+      loop: "{{ active_check.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.0 }}@{{ item.item.1.id }}"
+      when: action == 'status'
+
+    - name: Print HTTP /status report
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.id }} port={{ item.item.manageuser_port }}
+          http={{ item.status | default('n/a') }}
+          json={{ item.json | default('n/a') }}
+      loop: "{{ status_http.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+      when: action == 'status'
+
+    # --- logs path ---
+    - name: Capture recent journal for each tenant's unit pair
+      ansible.builtin.command:
+        cmd: "journalctl -u manageuser@{{ item.id }}.service -u getprofile@{{ item.id }}.service -n 200 --no-pager"
+      loop: "{{ target_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: tenant_logs
+      changed_when: false
+      when: action == 'logs'
+
+    - name: Print recent journal per tenant
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ tenant_logs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+      when: action == 'logs'

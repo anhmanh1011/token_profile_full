@@ -1,0 +1,20 @@
+---
+# Source tree on the CONTROL node = repo root. Playbook lives at
+# deploy/playbooks/site.yml ⇒ repo root = playbook_dir/../.. ; realpath makes it
+# robust regardless of symlinks. A guard task asserts this is really the repo.
+token_tool_src_dir: "{{ (playbook_dir + '/../..') | realpath }}"
+
+# Only these three trees are ever transferred (allowlist sync). The chown task
+# is scoped to exactly these, never the toolchain/cache dirs under HOME.
+token_tool_synced_subdirs:
+  - Manage_User
+  - Get_Profile
+  - email-gen
+
+# Build sub-paths on the TARGET (derived from common's token_tool_code_dir).
+manageuser_dir: "{{ token_tool_code_dir }}/Manage_User"
+manageuser_venv: "{{ token_tool_code_dir }}/Manage_User/.venv"
+getprofile_dir: "{{ token_tool_code_dir }}/Get_Profile"
+getprofile_bin: "{{ token_tool_code_dir }}/Get_Profile/get_profile"
+emailgen_dir: "{{ token_tool_code_dir }}/email-gen"
+emailgen_bin: "{{ token_tool_code_dir }}/email-gen/target/release/email-gen"

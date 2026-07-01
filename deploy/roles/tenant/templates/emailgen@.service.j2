@@ -1,0 +1,18 @@
+[Unit]
+Description=email-gen generate emails.txt (tenant %i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=tokentool
+Group=tokentool
+EnvironmentFile=/etc/token-tool/%i.env
+WorkingDirectory=/var/lib/token-tool/%i
+ExecStart=/opt/token-tool/email-gen/target/release/email-gen \
+  -d /var/lib/token-tool/%i/inputs/domains.txt \
+  -u /var/lib/token-tool/%i/inputs/usernames.txt \
+  -o /var/lib/token-tool/%i/emails.txt
+
+[Install]
+WantedBy=multi-user.target

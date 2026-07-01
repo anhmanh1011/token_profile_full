@@ -1,0 +1,16 @@
+---
+# deploy/playbooks/deploy.yml — rolling code update, one app VPS at a time.
+# Rebuild code via role `app`, then restart this VPS's tenant pairs.
+- name: Rolling update of app code (one VPS at a time)
+  hosts: app_vps
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+  roles:
+    - { role: app, tags: [app, build] }
+  post_tasks:
+    - name: Restart this VPS's tenant services after code update
+      ansible.builtin.include_role:
+        name: tenant
+        tasks_from: restart.yml

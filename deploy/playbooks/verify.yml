@@ -1,0 +1,109 @@
+---
+# deploy/playbooks/verify.yml — post-deploy functional verification.
+- name: Verify tenant deployments on each app VPS
+  hosts: app_vps
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Compute target tenants on this host
+      ansible.builtin.set_fact:
+        host_tenants: "{{ tenants | selectattr('vps', 'equalto', inventory_hostname) | list }}"
+
+    - name: manageuser@<id> is active
+      ansible.builtin.command: "systemctl is-active manageuser@{{ item.id }}.service"
+      register: mu_active
+      changed_when: false
+      loop: "{{ host_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Assert manageuser active
+      ansible.builtin.assert:
+        that: "item.stdout == 'active'"
+        fail_msg: "manageuser@{{ item.item.id }} is {{ item.stdout }}"
+        success_msg: "manageuser@{{ item.item.id }} active"
+      loop: "{{ mu_active.results }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+
+    - name: getprofile@<id> is active
+      ansible.builtin.command: "systemctl is-active getprofile@{{ item.id }}.service"
+      register: gp_active
+      changed_when: false
+      loop: "{{ host_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Assert getprofile active
+      ansible.builtin.assert:
+        that: "item.stdout == 'active'"
+        fail_msg: "getprofile@{{ item.item.id }} is {{ item.stdout }}"
+        success_msg: "getprofile@{{ item.item.id }} active"
+      loop: "{{ gp_active.results }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+
+    - name: GET /status returns 200 with expected keys
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item.manageuser_port }}/status"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: status_http
+      loop: "{{ host_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Assert /status payload shape
+      ansible.builtin.assert:
+        that:
+          - "'queue_size' in item.json"
+          - "'total_tokens' in item.json"
+          - "'total_deleted' in item.json"
+        fail_msg: "Bad /status payload for {{ item.item.id }}: {{ item.json }}"
+        success_msg: "{{ item.item.id }} /status ok (queue_size={{ item.json.queue_size }})"
+      loop: "{{ status_http.results }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+
+    - name: Capture get_profile outbound sockets (source IP check)
+      ansible.builtin.shell:
+        cmd: "set -o pipefail; ss -H -tnp 2>/dev/null | grep get_profile || true"
+        executable: /bin/bash
+      register: ss_out
+      changed_when: false
+
+    - name: Assert each tenant's local_ip appears as a get_profile source address
+      ansible.builtin.assert:
+        that: "item.local_ip in ss_out.stdout"
+        fail_msg: >-
+          No get_profile socket bound to {{ item.local_ip }} for {{ item.id }}.
+          ss snapshot:
+          {{ ss_out.stdout }}
+        success_msg: "{{ item.id }}: get_profile egress bound to {{ item.local_ip }}"
+      loop: "{{ host_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Stat node_exporter textfile metrics
+      ansible.builtin.stat:
+        path: "/var/lib/node_exporter/textfile/getprofile_{{ item.id }}.prom"
+      register: metric_stat
+      loop: "{{ host_tenants }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Assert metrics file exists and is fresh (< 120s old)
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - (ansible_date_time.epoch | int) - (item.stat.mtime | int) < 120
+        fail_msg: >-
+          Metrics file getprofile_{{ item.item.id }}.prom missing or stale
+          (exists={{ item.stat.exists }}, age={{ (ansible_date_time.epoch | int) - (item.stat.mtime | int) }}s).
+        success_msg: >-
+          {{ item.item.id }} metrics fresh
+          (age={{ (ansible_date_time.epoch | int) - (item.stat.mtime | int) }}s)
+      loop: "{{ metric_stat.results }}"
+      loop_control:
+        label: "{{ item.item.id }}"

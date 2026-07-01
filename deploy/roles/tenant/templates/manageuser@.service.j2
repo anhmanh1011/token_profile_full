@@ -1,0 +1,25 @@
+[Unit]
+Description=Manage_User API service (tenant %i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tokentool
+Group=tokentool
+EnvironmentFile=/etc/token-tool/%i.env
+WorkingDirectory=/var/lib/token-tool/%i
+ExecStart=/opt/token-tool/Manage_User/.venv/bin/python /opt/token-tool/Manage_User/app.py \
+  --host 0.0.0.0 \
+  --port ${MANAGEUSER_PORT} \
+  --config /etc/token-tool/admin_token.%i.json \
+  --local-ip ${LOCAL_IP} \
+  --license-sku ${LICENSE_SKU} \
+  --usage-location ${USAGE_LOCATION}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

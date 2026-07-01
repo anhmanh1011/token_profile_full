@@ -1,0 +1,54 @@
+---
+# ── Service identity ──────────────────────────────────────────────────────────
+# Non-root system user/group that owns code, runs builds and all tenant units.
+token_tool_user: tokentool
+token_tool_group: tokentool
+# HOME of the service user = code dir. Toolchain caches (Go: .cache/go-build,
+# go/; Rust: .cargo, .rustup) live under HOME but OUTSIDE the three synced
+# application subdirs, so the allowlist sync never touches them.
+token_tool_home: /opt/token-tool
+
+# ── Filesystem layout (canonical paths, reused by role `app`/`tenant`) ────────
+token_tool_code_dir: /opt/token-tool          # synced app trees + built binaries
+token_tool_config_dir: /etc/token-tool        # admin_token.<id>.json, <id>.env
+token_tool_state_dir: /var/lib/token-tool     # per-tenant <id>/ runtime state
+# node_exporter textfile collector dir; Get_Profile writes getprofile_<id>.prom.
+# The ARGS/listen-address + enable/start of node_exporter are owned by the
+# Plan 3 `observability` role; `common` only installs the package and creates
+# this directory so the dir exists before any tenant starts writing.
+node_exporter_textfile_dir: /var/lib/node_exporter/textfile
+
+# ── Base apt packages ─────────────────────────────────────────────────────────
+common_apt_packages:
+  - python3
+  - python3-venv
+  - python3-pip
+  - build-essential        # gcc/headers for native wheels (curl_cffi) + cgo
+  - acl                    # setfacl: reliable become_user: tokentool
+  - curl
+  - git
+  - rsync                  # required by ansible.posix.synchronize on the target
+  - ufw                    # firewall package; rules applied by observability role
+  - jq
+  - ca-certificates
+  - prometheus-node-exporter
+
+# ── Go toolchain (downloaded tarball → /usr/local/go) ─────────────────────────
+# go.mod requires `go 1.25.6`. Override go_arch to arm64 on ARM VPS.
+go_version: "1.25.6"
+go_arch: amd64
+go_install_root: /usr/local/go
+go_tarball: "go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
+go_download_url: "https://go.dev/dl/{{ go_tarball }}"
+go_download_dest: "/usr/local/src/{{ go_tarball }}"
+# Pinned SHA-256 for reproducible/offline installs. Empty (default) → the
+# official .sha256 is fetched on the TARGET host and format-validated before use.
+go_sha256: ""
+
+# ── Rust toolchain (rustup, under the service user's HOME) ────────────────────
+rust_toolchain: stable
+rust_profile: minimal
+cargo_home: "{{ token_tool_home }}/.cargo"
+rustup_home: "{{ token_tool_home }}/.rustup"
+rustup_init_url: "https://sh.rustup.rs"
+rustup_init_dest: "{{ token_tool_home }}/rustup-init.sh"

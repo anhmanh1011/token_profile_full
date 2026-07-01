@@ -1,0 +1,7 @@
+---
+# Reusable daemon-reload. Reused by the tenant role after it installs the
+# manageuser@/getprofile@/emailgen@ template units. No shell here → no host-wide
+# restart blast radius.
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true

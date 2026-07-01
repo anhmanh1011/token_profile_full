@@ -1,0 +1,7 @@
+{% if item.emailgen.usernames is defined %}
+{% for u in item.emailgen.usernames %}
+{{ u }}
+{% endfor %}
+{% else %}
+{{ lookup('file', item.emailgen.usernames_file) }}
+{% endif %}

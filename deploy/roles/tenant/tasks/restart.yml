@@ -1,0 +1,22 @@
+---
+# roles/tenant/tasks/restart.yml
+# Restart this host's tenant service pair after a code update (rolling deploy).
+- name: Compute tenants assigned to this host
+  ansible.builtin.set_fact:
+    host_tenants: "{{ tenants | selectattr('vps', 'equalto', inventory_hostname) | list }}"
+
+- name: Restart manageuser@<id> after code update
+  ansible.builtin.systemd_service:
+    name: "manageuser@{{ item.id }}.service"
+    state: restarted
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Restart getprofile@<id> after code update
+  ansible.builtin.systemd_service:
+    name: "getprofile@{{ item.id }}.service"
+    state: restarted
+  loop: "{{ host_tenants }}"
+  loop_control:
+    label: "{{ item.id }}"

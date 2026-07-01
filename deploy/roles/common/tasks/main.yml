@@ -1,0 +1,205 @@
+---
+# Role `common`: base packages, service user, directory layout, Go + Rust
+# toolchains. node_exporter is only INSTALLED here (package) + its textfile dir
+# created; its ARGS/listen-address/enable are owned by the Plan 3 `observability`
+# role (single owner of node_exporter runtime config).
+
+# ── Base packages ─────────────────────────────────────────────────────────────
+- name: Update apt cache (valid 1h to stay idempotent on immediate re-run)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base system packages (incl. acl for reliable become_user)
+  ansible.builtin.apt:
+    name: "{{ common_apt_packages }}"
+    state: present
+
+# ── Service user & group ──────────────────────────────────────────────────────
+- name: Ensure service group exists
+  ansible.builtin.group:
+    name: "{{ token_tool_group }}"
+    system: true
+
+- name: Ensure service user exists (system, nologin, HOME = code dir)
+  ansible.builtin.user:
+    name: "{{ token_tool_user }}"
+    group: "{{ token_tool_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ token_tool_home }}"
+    create_home: true
+
+# ── Directory layout ──────────────────────────────────────────────────────────
+- name: Ensure code dir exists (owned by service user)
+  ansible.builtin.file:
+    path: "{{ token_tool_code_dir }}"
+    state: directory
+    owner: "{{ token_tool_user }}"
+    group: "{{ token_tool_group }}"
+    mode: "0755"
+
+- name: Ensure config dir exists (root-owned, group-readable by service user)
+  ansible.builtin.file:
+    path: "{{ token_tool_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ token_tool_group }}"
+    mode: "0750"
+
+- name: Ensure state dir exists (owned by service user)
+  ansible.builtin.file:
+    path: "{{ token_tool_state_dir }}"
+    state: directory
+    owner: "{{ token_tool_user }}"
+    group: "{{ token_tool_group }}"
+    mode: "0750"
+
+- name: Ensure node_exporter textfile parent dir exists
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Mode 0755: .prom files hold only non-secret operational counters
+# (getprofile_* + tenant="<id>" label). World-read is acceptable and avoids a
+# fragile group-membership task against the package's node_exporter user.
+- name: Ensure node_exporter textfile dir exists (tokentool writes; node_exporter reads)
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir }}"
+    state: directory
+    owner: "{{ token_tool_user }}"
+    group: "{{ token_tool_group }}"
+    mode: "0755"
+
+# ── Go toolchain ──────────────────────────────────────────────────────────────
+- name: Detect installed Go version (read-only; runs in --check)
+  check_mode: false
+  ansible.builtin.command: "{{ go_install_root }}/bin/go version"
+  register: go_installed
+  changed_when: false
+  failed_when: false
+
+- name: Decide whether Go needs (re)installing
+  ansible.builtin.set_fact:
+    go_needs_install: "{{ ('go' + go_version) not in (go_installed.stdout | default('')) }}"
+
+- name: Ensure /usr/local/src exists for the Go tarball
+  ansible.builtin.file:
+    path: /usr/local/src
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: go_needs_install | bool
+
+- name: Fetch official Go checksum file when no pinned digest is set
+  ansible.builtin.get_url:
+    url: "{{ go_download_url }}.sha256"
+    dest: "{{ go_download_dest }}.sha256"
+    mode: "0644"
+    force: true
+  when:
+    - go_needs_install | bool
+    - go_sha256 | length == 0
+
+- name: Read the fetched Go checksum file
+  ansible.builtin.slurp:
+    src: "{{ go_download_dest }}.sha256"
+  register: go_sha256_slurp
+  when:
+    - go_needs_install | bool
+    - go_sha256 | length == 0
+
+- name: Resolve the effective Go checksum (pinned var or fetched file)
+  ansible.builtin.set_fact:
+    go_checksum_effective: >-
+      {{ go_sha256 if (go_sha256 | length > 0)
+         else ((go_sha256_slurp.content | b64decode).split() | first) }}
+  when: go_needs_install | bool
+
+- name: Assert the resolved Go checksum is a 64-hex SHA-256
+  ansible.builtin.assert:
+    that:
+      - go_checksum_effective is match('^[0-9a-f]{64}$')
+    fail_msg: "Resolved Go checksum is not a 64-hex SHA-256 digest: '{{ go_checksum_effective }}'"
+    quiet: true
+  when: go_needs_install | bool
+
+- name: Download Go tarball (SHA-256 verified)
+  ansible.builtin.get_url:
+    url: "{{ go_download_url }}"
+    dest: "{{ go_download_dest }}"
+    checksum: "sha256:{{ go_checksum_effective }}"
+    mode: "0644"
+  when: go_needs_install | bool
+
+- name: Remove previous Go install before re-extracting (version change only)
+  ansible.builtin.file:
+    path: "{{ go_install_root }}"
+    state: absent
+  when: go_needs_install | bool
+
+- name: Extract Go tarball into /usr/local
+  ansible.builtin.unarchive:
+    src: "{{ go_download_dest }}"
+    dest: /usr/local
+    remote_src: true
+    creates: "{{ go_install_root }}/bin/go"
+  when: go_needs_install | bool
+
+- name: Expose Go on the system PATH for interactive shells
+  ansible.builtin.copy:
+    dest: /etc/profile.d/go.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      export PATH="$PATH:{{ go_install_root }}/bin"
+
+# ── Rust toolchain (rustup, under the service user) ───────────────────────────
+- name: Detect installed Rust toolchain
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.stat:
+    path: "{{ cargo_home }}/bin/cargo"
+  register: cargo_bin
+
+- name: Download rustup installer (residual trust accepted; rustup verifies components)
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.get_url:
+    url: "{{ rustup_init_url }}"
+    dest: "{{ rustup_init_dest }}"
+    mode: "0755"
+  when: not cargo_bin.stat.exists
+
+- name: Install Rust toolchain via rustup (pinned stable/minimal)
+  become: true
+  become_user: "{{ token_tool_user }}"
+  ansible.builtin.command:
+    cmd: "{{ rustup_init_dest }} -y --no-modify-path --profile {{ rust_profile }} --default-toolchain {{ rust_toolchain }}"
+  environment:
+    HOME: "{{ token_tool_home }}"
+    CARGO_HOME: "{{ cargo_home }}"
+    RUSTUP_HOME: "{{ rustup_home }}"
+  register: rustup_install
+  changed_when: rustup_install.rc == 0
+  when: not cargo_bin.stat.exists
+
+- name: Remove the rustup installer after toolchain install (cleanup HOME)
+  ansible.builtin.file:
+    path: "{{ rustup_init_dest }}"
+    state: absent
+  when: not cargo_bin.stat.exists
+
+- name: Expose cargo on the system PATH for interactive shells
+  ansible.builtin.copy:
+    dest: /etc/profile.d/rust.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      export PATH="$PATH:{{ cargo_home }}/bin"
