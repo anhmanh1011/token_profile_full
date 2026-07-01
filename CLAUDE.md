@@ -9,19 +9,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cd Manage_User && pip install -r requirements.txt
 cd Manage_User && python app.py --port 5000
 # Per-tenant (callout IP): --config <admin file> --local-ip <vps source IP>
-cd Manage_User && python app.py --port 5000 --config admin_token.tenant1.json --local-ip 203.0.113.10
+# License (default a1-students=Office 365 A1 for students), usageLocation:
+cd Manage_User && python app.py --port 5000 --config admin_token.tenant1.json --local-ip 203.0.113.10 \
+    --license-sku a1-students --usage-location US
+# Per-tenant log file (avoid tenants sharing one service.log):
+MANAGE_USER_LOG_FILE=/var/lib/token-tool/t1/service.log python app.py --port 5000 --config admin_token.t1.json
+
+# Manage_User: run unit tests (pytest)
+cd Manage_User && pip install -r requirements-dev.txt && python -m pytest tests/ -q
 
 # Get_Profile: build & run
 cd Get_Profile && go build -o get_profile.exe .
 cd Get_Profile && ./get_profile.exe --api http://localhost:5000
-# Per-tenant (callout IP):
-cd Get_Profile && ./get_profile.exe --api http://localhost:5000 --local-ip 203.0.113.10
+# Per-tenant (callout IP + node_exporter textfile metrics + tenant label via --id):
+cd Get_Profile && ./get_profile.exe --api http://localhost:5000 --local-ip 203.0.113.10 \
+    --id t1 --metrics-file /var/lib/node_exporter/textfile/getprofile_t1.prom
 
 # Syntax check Python modules
 cd Manage_User && python -m py_compile app.py && python -m py_compile cleanup.py && python -m py_compile producer.py && python -m py_compile creator.py && python -m py_compile deleter.py && python -m py_compile token_getter.py && python -m py_compile source_ip.py && python -m py_compile admin_token_manager.py
 
-# Build & vet Go modules
-cd Get_Profile && go build . && go vet ./...
+# Build, vet & test Go modules
+cd Get_Profile && go build . && go vet ./... && go test ./...
+
+# Multi-VPS deploy (Ansible; see deploy/ + docs/superpowers/plans/2026-06-26-multi-vps-*)
+cd deploy && make help          # provision / deploy / status / verify / restart / logs
+cd deploy && make provision     # bootstrap app VPS fleet (idempotent)
+cd deploy && make deploy        # rolling code update (serial:1)
 
 # email-gen: build, test, bench (Rust)
 cd email-gen && cargo build --release
@@ -118,7 +131,11 @@ Default chunk-size = 2000 domains (không phải 20000 như spec gốc), để g
 - **1 VPS = 1 admin**: First admin from `admin_token.json` is used. To run **two tenants on one VPS** (e.g. one IPv4 + one IPv6), run two process sets, each with its own `--config <file>` and `--local-ip <ip>`. See `DEPLOY_DUAL_TENANT.md`.
 - **Per-tenant callout IP (`local_ip`)**: Optional `local_ip` field (admin config) / `--local-ip` flag binds all *external* outbound traffic to a fixed VPS source IP. Python: `requests` via `source_ip.SourceAddressAdapter` (urllib3 `source_address`) and `curl_cffi` via the `interface` option; Go: `netbind` sets `net.Dialer.LocalAddr` on the Loki and token-exchange clients. The Go localhost API client (`token/api.go`) is deliberately **not** bound, so loopback traffic to the Python service is never forced onto a public IP. Binding applies to direct dials only (this deployment uses no external proxy).
 - **User prefix `bot_`**: All app-created users have `bot_` prefix in userPrincipalName. Startup cleanup lists and deletes all `bot_` users for crash recovery.
-- **Shared AdminTokenManager**: Single `AdminTokenManager` instance handles admin OAuth for all modules. Thread-safe, auto-refresh, tracks refresh_token rotation, saves to `admin_token.json`.
+- **Shared AdminTokenManager**: Single `AdminTokenManager` instance handles admin OAuth for all modules. Thread-safe, auto-refresh, tracks refresh_token rotation. Persists a rotated refresh_token back to **this tenant's** `--config` file via the `config_path` ctor arg (`app.py` passes `--config`), not a fixed `admin_token.json` — so multiple tenants sharing one code dir never clobber each other's tokens.
+- **License selection (default Office 365 A1 for students)**: `creator.resolve_license_sku(skus, preference)` is a pure resolver. `--license-sku`/`app.py` default `a1-students` → matches `skuPartNumber == STANDARDWOFFPACK_STUDENT`, else falls back to the first SKU with a free seat (warned). A raw GUID is used only if that exact `skuId` has a free seat (uppercase input is canonicalised); any other string is treated as an exact `skuPartNumber`. Only SKUs with `enabled - consumed > 0` are eligible. `--usage-location` (default `US`) replaces the old hardcoded value.
+- **Per-tenant log isolation**: `app.py` reads `MANAGE_USER_LOG_FILE` (via `_resolve_log_file()`); unset/blank falls back to `<app dir>/service.log`. Each tenant unit points it at `/var/lib/token-tool/<id>/service.log`.
+- **Get_Profile runtime metrics**: `--metrics-file` writes a node_exporter textfile (`metrics.Write`, atomic tmp+fsync+rename) every 15s + a final flush on shutdown; metric names `getprofile_*`, label `tenant="<--id>"`. Consumed by the Prometheus textfile collector (see `deploy/`).
+- **Multi-VPS deployment (Ansible)**: `deploy/` holds an Ansible layer — `tenants.yml` single source of truth, `ansible-vault` secrets, systemd template units (`manageuser@`/`getprofile@`/`emailgen@`), roles `common`/`app`/`tenant`, and a `Makefile` wrapper. Observability (Grafana/Loki/Prometheus + node_exporter/Alloy) is Plan 3. Design + step plans: `docs/superpowers/{specs,plans}/2026-06-26-multi-vps-*`.
 - **Refresh tokens in queue, Go exchanges lazily**: Python browser flow returns the raw refresh_token (~24h TTL) — no Loki rescope on the Python side. Queue contains refresh_token + tenant_id; Go's `token.Manager.GetAccessToken` lazily exchanges to a Loki access_token (~1h TTL) on first use and re-exchanges when the cached access_token nears expiry, so one refresh_token yields many access_tokens over its 24h window. Exchange failures retry 2× with 1s backoff; permanent failures (invalid_grant) or 401/424/500-exhausted responses still trigger user deletion as before.
 - **Permanently delete users**: All user deletions (cleanup + runtime) are permanent — soft-delete via Graph API followed by `DELETE /directory/deletedItems/{id}` to purge from recycle bin. Prevents Directory_QuotaExceeded.
 - **Graph Batch API**: Both deleter and creator use `/$batch` endpoint with `BATCH_SIZE=20` (Graph API max per batch).

@@ -1,5 +1,11 @@
 # Multi-VPS — Ansible + systemd Deployment Plan (Plan 2/3)
 
+> 🟡 **TRẠNG THÁI: SCAFFOLD + CODE-PREREQ ĐÃ THỰC THI; BƯỚC CHẠY-HOST DEFERRED (2026-06-30).**
+> - ✅ **2 code-prereq Python** (TDD, đã test): `AdminTokenManager.config_path` (token xoay ghi về `--config` per-tenant) + `MANAGE_USER_LOG_FILE`/`_resolve_log_file()`.
+> - ✅ **Toàn bộ `deploy/`** đã tạo + **validate tĩnh**: `ansible-playbook --syntax-check` (4 playbook OK), `ansible-lint` (pass profile `min`; còn `var-naming` style do biến `token_tool_*` chia sẻ xuyên role — cố ý), `ansible-inventory --graph`, jinja2 parse (7 template), vault round-trip, Makefile TAB/guard.
+> - ⏸️ **DEFERRED (cần hạ tầng thật):** `--check`/chạy thật/idempotence-on-host/verify (`ss` source-IP, `curl /status`, metrics freshness) — cần SSH tới 3 VPS + secret trong vault.
+> - Quyết định hợp nhất đã áp dụng: inventory `hosts.yml`; group `ops`/host `ops1` tách tên; một Makefile (`action`/`tenant`); node_exporter do role `observability` (Plan 3) sở hữu, `common` chỉ cài package + tạo textfile dir; `site.yml` phạm vi Plan 2 (common/app/tenant), Plan 3 sẽ nối observability + play ops.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 >
 > **Language skills (CLAUDE.md, mandatory):** Python tasks → `python-patterns`, `python-testing`, `security-review`. Ansible/systemd/secrets → `security-review`, `deployment-patterns`, `docker-patterns` (Plan 3).
