@@ -50,10 +50,19 @@ Unit template: `manageuser@<id>.service`, `getprofile@<id>.service`,
 `emailgen@<id>.service` (Type=oneshot). Port: `tenant.manageuser_port`
 (5000, 5001, ...). Get_Profile gọi `--api http://127.0.0.1:<port>`.
 
+## Kết nối SSH (root + password auth)
+
+Hiện cấu hình dùng **user `root` + mật khẩu** (không phải SSH key):
+- Control node phải cài **`sshpass`**: `sudo apt install sshpass` (Linux) / `brew install hudochenkov/sshpass/sshpass` (macOS).
+- Mật khẩu root mỗi host nằm trong **vault** (`vps_ssh_passwords`), KHÔNG hardcode trong inventory.
+- Là root nên `become` (đổi sang user `tokentool`) không cần mật khẩu sudo.
+- Chuyển sang SSH key sau này: bỏ `ansible_password` trong `inventory/hosts.yml`, khôi phục `PubkeyAuthentication` trong `ansible.cfg`, thêm key vào host.
+
 ## Quy trình
 
-1. Cài: `ansible-galaxy collection install -r requirements.yml`.
+1. Cài: `ansible-galaxy collection install -r requirements.yml` + `sshpass` (xem trên).
 2. Điền IP thật vào `group_vars/all/tenants.yml` (`app_vps`, `ops_host`).
-3. Tạo secret: xem hướng dẫn trong `group_vars/all/vault.yml.example`.
-4. `make provision` (bootstrap) → `make deploy` (cập nhật) → `make verify`.
+3. Tạo secret: xem hướng dẫn trong `group_vars/all/vault.yml.example`
+   (gồm `vps_ssh_passwords` cho SSH + `vault_<id>_refresh`/`_tenant_id` cho M365).
+4. `make ping` (kiểm tra SSH tới host) → `make provision` (bootstrap) → `make verify`.
 5. (Plan 3) `make monitoring-up` để dựng giám sát trên ops node.

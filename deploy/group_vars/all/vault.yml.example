@@ -43,3 +43,12 @@ vault_t6_tenant_id: "66666666-6666-6666-6666-666666666666"
 
 # --- ops node (Plan 3 monitoring stack) ---
 vault_grafana_admin_password: "change-me-strong-grafana-admin-pass"
+
+# --- SSH root password mỗi host (password auth) ---
+# Key = inventory_hostname (vps1/vps2/vps3/ops1). Dùng root; không cần sudo password.
+# Nếu mọi host chung 1 mật khẩu, đặt cùng giá trị cho cả 4.
+vps_ssh_passwords:
+  vps1: "root-ssh-pass-vps1"
+  vps2: "root-ssh-pass-vps2"
+  vps3: "root-ssh-pass-vps3"
+  ops1: "root-ssh-pass-ops"
