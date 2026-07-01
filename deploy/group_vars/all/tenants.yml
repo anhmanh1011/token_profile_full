@@ -29,10 +29,15 @@ tenant_defaults:
   max_cpm: 20000
 
 tenants:
-  # ---- VPS1: t1 (IPv4) + t2 (IPv4) ---------------------------------------
+  # ---- VPS1: t1 (IPv4) + t2 (IPv6) ---------------------------------------
+  # Mỗi VPS có 1 IPv4 + 1 IPv6: tenant A egress qua IPv4 (= ansible_host, đích SSH),
+  # tenant B egress qua IPv6. THAY các IP mẫu bằng IP thật của từng VPS.
+  # LƯU Ý: xác minh Loki (eur.loki.delve.office.com) reachable qua IPv6 TRƯỚC khi
+  # giao tenant cho IPv6 (xem DEPLOY_DUAL_TENANT.md):
+  #   curl --interface <IPv6> -sS -o /dev/null -w '%{http_code}\n' https://eur.loki.delve.office.com/
   - id: t1
     vps: vps1
-    local_ip: 203.0.113.10
+    local_ip: 203.0.113.10          # IPv4 của vps1 (= ansible_host)
     manageuser_port: 5000
     admin:
       tenant_id: "{{ vault_t1_tenant_id }}"
@@ -49,7 +54,7 @@ tenants:
 
   - id: t2
     vps: vps1
-    local_ip: 203.0.113.11
+    local_ip: "2001:db8:1::10"      # IPv6 của vps1 (chuỗi -> phải quote)
     manageuser_port: 5001
     admin:
       tenant_id: "{{ vault_t2_tenant_id }}"
@@ -64,7 +69,7 @@ tenants:
     workers: 400
     max_cpm: 20000
 
-  # ---- VPS2: t3 (IPv4, usernames_file) + t4 (IPv6, license GUID override) -
+  # ---- VPS2: t3 (IPv4, usernames_file) + t4 (IPv6, partnumber override) --
   - id: t3
     vps: vps2
     local_ip: 198.51.100.10
@@ -85,7 +90,7 @@ tenants:
 
   - id: t4
     vps: vps2
-    local_ip: "2001:db8:51::10"      # IPv6 callout IP (chuỗi -> phải quote)
+    local_ip: "2001:db8:2::10"       # IPv6 của vps2 (chuỗi -> phải quote)
     manageuser_port: 5001
     admin:
       tenant_id: "{{ vault_t4_tenant_id }}"
@@ -121,7 +126,7 @@ tenants:
 
   - id: t6
     vps: vps3
-    local_ip: "2001:db8:2::10"       # IPv6
+    local_ip: "2001:db8:3::10"       # IPv6 của vps3
     manageuser_port: 5001
     admin:
       tenant_id: "{{ vault_t6_tenant_id }}"
