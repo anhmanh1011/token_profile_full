@@ -95,29 +95,25 @@
     mode: "0755"
   when: go_needs_install | bool
 
-- name: Fetch official Go checksum file when no pinned digest is set
-  ansible.builtin.get_url:
-    url: "{{ go_download_url }}.sha256"
-    dest: "{{ go_download_dest }}.sha256"
-    mode: "0644"
-    force: true
+# go.dev does NOT serve per-file .sha256 URLs; the checksums live in the release
+# index JSON (https://go.dev/dl/?mode=json&include=all). Fetch that and pick the
+# sha256 for our exact tarball filename.
+- name: Fetch the Go release index (to resolve the tarball checksum)
+  ansible.builtin.uri:
+    url: "https://go.dev/dl/?mode=json&include=all"
+    return_content: true
+  register: go_release_index
   when:
     - go_needs_install | bool
     - go_sha256 | length == 0
 
-- name: Read the fetched Go checksum file
-  ansible.builtin.slurp:
-    src: "{{ go_download_dest }}.sha256"
-  register: go_sha256_slurp
-  when:
-    - go_needs_install | bool
-    - go_sha256 | length == 0
-
-- name: Resolve the effective Go checksum (pinned var or fetched file)
+- name: Resolve the effective Go checksum (pinned var or release index)
   ansible.builtin.set_fact:
     go_checksum_effective: >-
       {{ go_sha256 if (go_sha256 | length > 0)
-         else ((go_sha256_slurp.content | b64decode).split() | first) }}
+         else (go_release_index.json | map(attribute='files') | flatten
+               | selectattr('filename', 'equalto', go_tarball)
+               | map(attribute='sha256') | first) }}
   when: go_needs_install | bool
 
 - name: Assert the resolved Go checksum is a 64-hex SHA-256

@@ -8,6 +8,10 @@
   any_errors_fatal: true
   max_fail_percentage: 0
   roles:
+    # common is idempotent (base already provisioned); included so its shared
+    # path/identity defaults (token_tool_code_dir, service user, toolchains) are
+    # in scope for the app role when deploy.yml runs without site.yml.
+    - { role: common, tags: [common, base] }
     - { role: app, tags: [app, build] }
   post_tasks:
     - name: Restart this VPS's tenant services after code update

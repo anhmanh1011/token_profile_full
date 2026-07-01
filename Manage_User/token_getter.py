@@ -39,6 +39,7 @@ class TeamOutLook:
         password: str,
         proxy: Optional[str] = None,
         local_ip: Optional[str] = None,
+        admin_tenant_id: str = "",
     ):
         self.mail = email
         self.pwd = password
@@ -49,7 +50,12 @@ class TeamOutLook:
             impersonate="firefox135", timeout=60, interface=self.interface
         )
         self.data_proxy = None
-        self.tenant_id = ""
+        # Bot users live in the admin's directory, so their tenant_id == the
+        # admin's tenant_id. Default to it; the fragile reporting-endpoints
+        # header scrape (below) only overrides when it actually finds a value,
+        # so tenants whose header lacks it (observed on some directories) still
+        # get a valid tenant_id instead of an empty one that breaks token exchange.
+        self.tenant_id = admin_tenant_id
 
         if proxy:
             parts = proxy.split(":")
@@ -488,6 +494,7 @@ class BulkTokenGetter:
         workers: int = DEFAULT_WORKERS,
         proxy: Optional[str] = None,
         local_ip: Optional[str] = None,
+        admin_tenant_id: str = "",
     ):
         """
         Args:
@@ -495,11 +502,14 @@ class BulkTokenGetter:
             workers: Number of concurrent threads
             proxy: Optional proxy string
             local_ip: Optional outbound source IP (callout IP)
+            admin_tenant_id: The tenant's directory tenant_id (bot users belong
+                to it); used as the token tenant_id so exchange never gets empty.
         """
         self.users = users
         self.workers = workers
         self.proxy = proxy
         self.local_ip = local_ip
+        self.admin_tenant_id = admin_tenant_id
 
         # Results
         self.tokens: list[dict] = []
@@ -516,7 +526,8 @@ class BulkTokenGetter:
 
             try:
                 obj = TeamOutLook(
-                    user["email"], user["password"], self.proxy, self.local_ip
+                    user["email"], user["password"], self.proxy, self.local_ip,
+                    admin_tenant_id=self.admin_tenant_id,
                 )
                 if obj.do_task():
                     with self.stats_lock:

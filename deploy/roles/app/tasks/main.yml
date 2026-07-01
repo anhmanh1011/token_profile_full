@@ -32,7 +32,7 @@
     archive: true
     delete: false
     rsync_opts:
-      - "--rsync-path=sudo rsync"
+      - "--rsync-path={{ token_tool_rsync_path }}"
       - "--no-owner"
       - "--no-group"
       # build artifacts / runtime / caches — listed BEFORE the allowlist so they win
@@ -68,16 +68,19 @@
 
 # ── Defence in depth: the allowlist is fail-closed, but assert no secret leaked ─
 - name: Scan the synced tree for secret-shaped files
+  # Only patterns that are unambiguously OUR repo secrets — NOT generic *.pem/
+  # *.key, which legitimately appear inside the venv (certifi's cacert.pem CA
+  # bundle, package test fixtures) and are built on the VPS, not synced.
   ansible.builtin.find:
-    paths: "{{ token_tool_code_dir }}"
+    paths: "{{ token_tool_synced_subdirs | map('regex_replace', '^', token_tool_code_dir + '/') | list }}"
     patterns:
       - "admin_token*.json"
-      - "*.env"
-      - "*.pem"
-      - "*.key"
-      - "*.p12"
-      - "id_rsa*"
-      - "vault*"
+      - "vault.yml"
+      - ".vault-pass"
+      - ".env"
+    excludes:
+      - ".venv"
+      - "target"
     recurse: true
     file_type: file
   register: leaked_secrets

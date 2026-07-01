@@ -18,3 +18,8 @@ getprofile_dir: "{{ token_tool_code_dir }}/Get_Profile"
 getprofile_bin: "{{ token_tool_code_dir }}/Get_Profile/get_profile"
 emailgen_dir: "{{ token_tool_code_dir }}/email-gen"
 emailgen_bin: "{{ token_tool_code_dir }}/email-gen/target/release/email-gen"
+
+# Remote rsync command for synchronize. When connecting as root, plain `rsync`
+# (no sudo needed). For a non-root sudo user, `sudo rsync` so the remote rsync
+# can write the tokentool-owned code dir.
+token_tool_rsync_path: "{{ 'rsync' if (ansible_user | default('')) == 'root' else 'sudo rsync' }}"

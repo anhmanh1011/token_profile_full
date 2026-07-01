@@ -108,7 +108,11 @@ class TokenProducer:
         logger.info("Created %d users, getting tokens...", len(created_users))
 
         # Step 2: Get refresh tokens (bound to this tenant's callout IP)
-        getter = BulkTokenGetter(created_users, local_ip=self.token_mgr.local_ip)
+        getter = BulkTokenGetter(
+            created_users,
+            local_ip=self.token_mgr.local_ip,
+            admin_tenant_id=self.token_mgr.tenant_id,
+        )
         token_result = getter.run()
         tokens = token_result["tokens"]
 

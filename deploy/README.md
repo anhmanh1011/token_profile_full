@@ -6,11 +6,13 @@ tối đa 2 tenant) + 1 ops node (Grafana + Grafana Loki + Prometheus).
 Mọi lệnh chạy với CWD = thư mục `deploy/` này (Ansible tự nạp `ansible.cfg`).
 Dùng `make help` để xem các thao tác.
 
-> **Lưu ý thực thi:** các bước `--check`/chạy thật/verify trong 2 plan
-> (`docs/superpowers/plans/2026-06-26-multi-vps-*.md`) cần SSH tới VPS thật +
-> secret trong vault. Các file ở đây đã được validate **tĩnh** (ansible
-> syntax-check, ansible-lint, inventory graph, jinja/yaml parse, vault round-trip)
-> nhưng chưa chạy lên host nào.
+> **Trạng thái:** đã **deploy thật thành công** lên 1 VPS Debian 13 (2 tenant:
+> IPv4 + IPv6) — provision (Go/Rust/venv/build) + systemd units + tạo user M365 +
+> license A1-students + fetch profile qua Loki trên cả IPv4 và IPv6 (source-IP
+> binding xác nhận qua log `[CALLOUT]`). Quá trình deploy thật đã lộ + sửa 7 bug
+> (callback, inventory location, Go checksum, rsync-path, deploy.yml role scope,
+> secret-scan false-positive, token_getter tenant_id). Vẫn cần điền IP/secret
+> thật + `sshpass` trên control node để chạy.
 
 ## Bản đồ file
 
@@ -18,7 +20,7 @@ Dùng `make help` để xem các thao tác.
 |-----------|------|-------|
 | `ansible.cfg` | 2 | Cấu hình Ansible (inventory, roles_path, vault, callback) |
 | `requirements.yml` | 2 | Collection cần cài (community.general/docker, ansible.posix) |
-| `inventory/hosts.yml` | 2 | Inventory tĩnh: nhóm `app_vps` (vps1..3) + `ops` |
+| `inventory.yml` | 2 | Inventory tĩnh: nhóm `app_vps` (vps1..3) + `ops` |
 | `group_vars/all/tenants.yml` | 2 | NGUỒN CẤU HÌNH DUY NHẤT: app_vps, ops_host, danh sách tenant |
 | `group_vars/all/vault.yml.example` | 2 | MẪU plaintext của secret (commit được) |
 | `group_vars/all/vault.yml` | 2 | Secret thật, ansible-vault (KHÔNG commit — gitignore) |
@@ -56,7 +58,7 @@ Hiện cấu hình dùng **user `root` + mật khẩu** (không phải SSH key):
 - Control node phải cài **`sshpass`**: `sudo apt install sshpass` (Linux) / `brew install hudochenkov/sshpass/sshpass` (macOS).
 - Mật khẩu root mỗi host nằm trong **vault** (`vps_ssh_passwords`), KHÔNG hardcode trong inventory.
 - Là root nên `become` (đổi sang user `tokentool`) không cần mật khẩu sudo.
-- Chuyển sang SSH key sau này: bỏ `ansible_password` trong `inventory/hosts.yml`, khôi phục `PubkeyAuthentication` trong `ansible.cfg`, thêm key vào host.
+- Chuyển sang SSH key sau này: bỏ `ansible_password` trong `inventory.yml`, khôi phục `PubkeyAuthentication` trong `ansible.cfg`, thêm key vào host.
 
 ## Quy trình
 
