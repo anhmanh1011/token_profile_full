@@ -116,11 +116,12 @@ func main() {
 	log.Println("[TOKEN] Fetching initial tokens from API...")
 	var fetched int
 	for fetched == 0 {
-		tokens, err := apiClient.FetchTokens(300)
+		tokens, tenantID, err := apiClient.FetchTokens(300)
 		if err != nil {
 			log.Printf("[TOKEN] Pre-fetch error: %v", err)
 			break
 		}
+		tokenManager.SetTenantID(tenantID)
 		if tokens == nil {
 			log.Println("[TOKEN] Pre-fetch: API queue empty, waiting 2s...")
 			time.Sleep(2 * time.Second)
@@ -134,7 +135,11 @@ func main() {
 	if fetched == 0 {
 		log.Fatalf("[ERROR] Failed to pre-fetch any tokens from API")
 	}
-	log.Printf("[TOKEN] Pre-fetched %d tokens, queue length: %d", fetched, tokenManager.QueueLen())
+	if tokenManager.TenantID() == "" {
+		log.Fatalf("[ERROR] API did not return tenant_id; check Manage_User admin_token.json")
+	}
+	log.Printf("[TOKEN] Pre-fetched %d tokens (tenant=%s), queue length: %d",
+		fetched, tokenManager.TenantID(), tokenManager.QueueLen())
 
 	// Create dead token channel and set on manager
 	deadChan := make(chan string, 1000)
@@ -165,12 +170,13 @@ func main() {
 			}
 
 			if tokenManager.QueueLen() < 100 {
-				tokens, err := apiClient.FetchTokens(300)
+				tokens, tenantID, err := apiClient.FetchTokens(300)
 				if err != nil {
 					log.Printf("[TOKEN] Background fetch error: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
+				tokenManager.SetTenantID(tenantID)
 				if tokens == nil {
 					time.Sleep(2 * time.Second)
 					continue

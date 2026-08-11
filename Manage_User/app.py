@@ -52,6 +52,7 @@ _delete_stats_lock = threading.Lock()
 _producer: TokenProducer | None = None
 _admin_config: dict | None = None
 _token_mgr: AdminTokenManager | None = None
+_tenant_id: str = ""
 
 # ── Flask app ────────────────────────────────────────────────────────────────
 
@@ -133,11 +134,14 @@ def get_next_token():
     """Pop tokens from the in-memory queue.
 
     Query params:
-        count: number of tokens to return (default 100, max 200)
+        count: number of tokens to return (default 100, max 500)
 
     Returns:
-        200: {"tokens": [{...}, ...], "count": N}
-        202: {"waiting": true, "count": 0}  — queue is currently empty
+        200: {"tokens": [{...}, ...], "count": N, "tenant_id": "..."}
+        202: {"waiting": true, "count": 0, "tenant_id": "..."} — queue empty
+
+    tenant_id is deployment-wide (from admin_token.json) — same value on every
+    batch; clients only need to remember it once.
     """
     count = min(request.args.get("count", 100, type=int), 500)
     tokens = []
@@ -147,15 +151,14 @@ def get_next_token():
             tokens.append({
                 "email": tok["email"],
                 "refresh_token": tok["refresh_token"],
-                "tenant_id": tok["tenant_id"],
             })
         except queue.Empty:
             break
 
     if not tokens:
-        return jsonify({"waiting": True, "count": 0}), 202
+        return jsonify({"waiting": True, "count": 0, "tenant_id": _tenant_id}), 202
 
-    return jsonify({"tokens": tokens, "count": len(tokens)}), 200
+    return jsonify({"tokens": tokens, "count": len(tokens), "tenant_id": _tenant_id}), 200
 
 
 @app.post("/users/delete")
@@ -245,7 +248,7 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
         3. Start TokenProducer background thread.
         4. Start Flask HTTP server.
     """
-    global _admin_config, _producer, _token_mgr
+    global _admin_config, _producer, _token_mgr, _tenant_id
 
     logger.info("=" * 60)
     logger.info("  Manage_User API Service starting on %s:%d", host, port)
@@ -254,9 +257,12 @@ def start_service(host: str = "0.0.0.0", port: int = 5000) -> None:
     # Step 1: Load admin and create shared token manager
     try:
         _admin_config = _load_admin_config()
+        _tenant_id = _admin_config["tenant_id"]
         _token_mgr = AdminTokenManager(_admin_config)
         logger.info(
-            "Loaded admin config: domain=%s", _admin_config.get("domain", "?")
+            "Loaded admin config: domain=%s tenant=%s",
+            _admin_config.get("domain", "?"),
+            _tenant_id,
         )
     except Exception as e:
         logger.error("Failed to load admin config: %s", e)

@@ -30,13 +30,15 @@ type APIClient struct {
 type fetchTokenResponse struct {
 	Email        string `json:"email"`
 	RefreshToken string `json:"refresh_token"`
-	TenantID     string `json:"tenant_id"`
 }
 
 // fetchBatchResponse is the JSON payload returned by GET /tokens/next?count=N.
+// TenantID is deployment-wide (1 VPS = 1 admin) and echoed on every batch —
+// callers set it on the Manager once and reuse for all refresh_token exchanges.
 type fetchBatchResponse struct {
-	Tokens []fetchTokenResponse `json:"tokens"`
-	Count  int                  `json:"count"`
+	Tokens   []fetchTokenResponse `json:"tokens"`
+	Count    int                  `json:"count"`
+	TenantID string               `json:"tenant_id"`
 }
 
 // deleteRequest is the JSON payload sent to POST /users/delete.
@@ -56,10 +58,11 @@ func NewAPIClient(baseURL string) *APIClient {
 	}
 }
 
-// FetchTokens calls GET {baseURL}/tokens/next?count=N and returns up to N tokens.
-// Returns nil (empty slice) when the queue is empty (202); caller should retry.
-// Connection errors are retried up to 3 times with a 5-second pause.
-func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
+// FetchTokens calls GET {baseURL}/tokens/next?count=N and returns up to N tokens
+// plus the deployment tenant_id echoed by the server. tenantID may be non-empty
+// even when tokens is nil (queue empty, 202) — callers should still propagate it
+// to the Manager. Connection errors are retried up to 3 times with a 5-second pause.
+func (c *APIClient) FetchTokens(count int) (tokens []*TokenInfo, tenantID string, err error) {
 	url := fmt.Sprintf("%s/tokens/next?count=%d", c.baseURL, count)
 
 	var lastErr error
@@ -88,30 +91,29 @@ func (c *APIClient) FetchTokens(count int) ([]*TokenInfo, error) {
 		}
 
 		switch resp.StatusCode {
-		case http.StatusOK:
+		case http.StatusOK, http.StatusAccepted:
 			var batch fetchBatchResponse
 			if err := json.Unmarshal(body, &batch); err != nil {
-				return nil, fmt.Errorf("token/api: parse batch response: %w", err)
+				return nil, "", fmt.Errorf("token/api: parse batch response: %w", err)
 			}
-			tokens := make([]*TokenInfo, 0, len(batch.Tokens))
+			if resp.StatusCode == http.StatusAccepted {
+				return nil, batch.TenantID, nil // Queue empty; tenant_id still useful.
+			}
+			out := make([]*TokenInfo, 0, len(batch.Tokens))
 			for _, t := range batch.Tokens {
-				tokens = append(tokens, &TokenInfo{
+				out = append(out, &TokenInfo{
 					Username:     t.Email,
 					RefreshToken: t.RefreshToken,
-					TenantID:     t.TenantID,
 				})
 			}
-			return tokens, nil
-
-		case http.StatusAccepted:
-			return nil, nil // Queue empty
+			return out, batch.TenantID, nil
 
 		default:
-			return nil, fmt.Errorf("token/api: unexpected status %d", resp.StatusCode)
+			return nil, "", fmt.Errorf("token/api: unexpected status %d", resp.StatusCode)
 		}
 	}
 
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
 // QueueDelete enqueues email for batch deletion. The send is non-blocking;

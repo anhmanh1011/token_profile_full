@@ -28,9 +28,11 @@ const (
 // RefreshToken is stable for the ~24h refresh_token TTL; AccessToken is
 // minted from it via ExchangeRefreshToken and cached with ExpiresAt until
 // it nears expiry, then re-minted using the same RefreshToken.
+//
+// tenant_id is deployment-wide (1 VPS = 1 admin) and lives on the Manager,
+// not on each token.
 type TokenInfo struct {
 	Username     string
-	TenantID     string
 	RefreshToken string
 
 	mu          sync.Mutex // guards AccessToken + ExpiresAt swap during lazy exchange
@@ -49,6 +51,12 @@ type Manager struct {
 
 	// HTTP client used for refresh_token → access_token exchange.
 	exchangeClient *http.Client
+
+	// Deployment-wide tenant_id sourced from admin_token.json (via API batch
+	// response). Set once at startup by SetTenantID; sync.RWMutex allows
+	// concurrent readers with occasional refresh writes.
+	tenantIDMu sync.RWMutex
+	tenantID   string
 
 	// Token queue — workers acquire/release here.
 	tokenQueue chan *TokenInfo
@@ -76,6 +84,25 @@ func NewManager() *Manager {
 // SetDeadChan sets the channel for dead token email notifications.
 func (m *Manager) SetDeadChan(ch chan<- string) {
 	m.deadChan = ch
+}
+
+// SetTenantID stores the deployment-wide tenant_id used for refresh_token
+// exchange. Safe to call repeatedly; empty tenantID is ignored so callers can
+// pass through the server-echoed value on every batch without extra guards.
+func (m *Manager) SetTenantID(tenantID string) {
+	if tenantID == "" {
+		return
+	}
+	m.tenantIDMu.Lock()
+	m.tenantID = tenantID
+	m.tenantIDMu.Unlock()
+}
+
+// TenantID returns the currently configured tenant_id.
+func (m *Manager) TenantID() string {
+	m.tenantIDMu.RLock()
+	defer m.tenantIDMu.RUnlock()
+	return m.tenantID
 }
 
 // AddToken adds a single token to the manager and pushes it to the queue
@@ -220,7 +247,12 @@ func (m *Manager) GetAccessToken(token *TokenInfo) (string, error) {
 		return "", fmt.Errorf("token has no refresh_token")
 	}
 
-	accessToken, expiresIn, err := ExchangeRefreshToken(m.exchangeClient, token.TenantID, token.RefreshToken)
+	tenantID := m.TenantID()
+	if tenantID == "" {
+		return "", fmt.Errorf("manager tenant_id not set")
+	}
+
+	accessToken, expiresIn, err := ExchangeRefreshToken(m.exchangeClient, tenantID, token.RefreshToken)
 	if err != nil {
 		return "", err
 	}

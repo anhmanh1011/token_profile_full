@@ -3,8 +3,11 @@ Bulk Token Getter — Obtain Microsoft Graph refresh tokens via Teams browser fl
 
 `TeamOutLook` drives the Teams MSAL flow with curl_cffi Firefox impersonation
 (authorize → login → optional forced password change → KMSI → code exchange)
-and stores the resulting refresh_token + tenant_id. `BulkTokenGetter` runs a
-pool of 30 worker threads over a user list and returns `{tokens, failed}`.
+and stores the resulting refresh_token. `BulkTokenGetter` runs a pool of 30
+worker threads over a user list and returns `{tokens, failed}`.
+
+tenant_id is deployment-wide (1 VPS = 1 admin) and read from admin_token.json
+by app.py — it is not extracted per user here.
 
 Go side exchanges refresh_token → Loki-scoped access_token lazily per worker
 to take advantage of the ~24h refresh_token TTL (vs ~1h access_token TTL).
@@ -37,7 +40,6 @@ class TeamOutLook:
         self.newpwd = self.pwd + "1"
         self.session = requests.Session(impersonate="firefox135", timeout=60)
         self.data_proxy = None
-        self.tenant_id = ""
 
         if proxy:
             parts = proxy.split(":")
@@ -174,13 +176,6 @@ class TeamOutLook:
             data=data,
             allow_redirects=False,
         )
-
-        try:
-            self.tenant_id = re.findall(
-                r'tenant=(.*?)"', response.headers.get("reporting-endpoints", "")
-            )[0]
-        except IndexError:
-            logger.debug("%s - Could not extract tenant_id", self.mail)
 
         return response.text
 
@@ -426,7 +421,7 @@ class TeamOutLook:
             return False
 
         self.refresh_token = response.json()["refresh_token"]
-        logger.info("%s - Refresh token obtained (tenant: %s)", self.mail, self.tenant_id)
+        logger.info("%s - Refresh token obtained", self.mail)
         return True
 
     def do_task(self) -> bool:
@@ -506,7 +501,6 @@ class BulkTokenGetter:
                             {
                                 "email": user["email"],
                                 "refresh_token": obj.refresh_token,
-                                "tenant_id": obj.tenant_id,
                             }
                         )
                 else:
@@ -537,7 +531,7 @@ class BulkTokenGetter:
 
         Returns:
             {
-                "tokens": [{"email": str, "refresh_token": str, "tenant_id": str}, ...],
+                "tokens": [{"email": str, "refresh_token": str}, ...],
                 "failed": int,
             }
         """
